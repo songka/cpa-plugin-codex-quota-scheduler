@@ -4,10 +4,14 @@ import (
 	"sort"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 type PickDecision struct {
+	Reject       bool
+	RejectCode   string
+	RejectReason string
+
 	AuthID          string
 	Handled         bool
 	DelegateBuiltin string
@@ -96,6 +100,9 @@ func PickCodexAccount(req pluginapi.SchedulerPickRequest, snapshot StateSnapshot
 
 	ordered := BuildOrderedAccounts(req, snapshot, now)
 	if len(ordered) == 0 {
+		if snapshot.Config.ReserveEnabled && snapshot.Config.ReserveStrict {
+			return reserveRejectDecision()
+		}
 		return PickDecision{Reason: "no_codex_candidates", Ordered: ordered}
 	}
 	for _, account := range ordered {
@@ -109,6 +116,9 @@ func PickCodexAccount(req pluginapi.SchedulerPickRequest, snapshot StateSnapshot
 		}
 	}
 
+	if snapshot.Config.ReserveEnabled && snapshot.Config.ReserveStrict {
+		return reserveRejectDecision()
+	}
 	if snapshot.Config.Fallback == FallbackFillFirst {
 		return PickDecision{
 			Handled:         true,
@@ -186,6 +196,11 @@ func buildOrderedAccounts(req pluginapi.SchedulerPickRequest, snapshot StateSnap
 		// account priority can lag an admission update.
 		view.CPAPriority = candidatePriority
 		selectionClass := ClassifyAccount(view, now)
+		if view.ReserveBlocked {
+			available = false
+			reason = view.ReserveReason
+			queueStatus = QueueStatusUnavailable
+		}
 		if selectionClass == Excluded && available && view.Trial != TrialNone {
 			queueStatus = QueueStatusUnavailable
 			available = false

@@ -107,6 +107,8 @@ type ResetProbeState struct {
 }
 
 type AccountAnnotation struct {
+	ReserveOverride *ReserveOverride `json:"reserve_override,omitempty" yaml:"reserve_override,omitempty"`
+
 	Alias             string   `json:"alias,omitempty" yaml:"alias,omitempty"`
 	Notes             string   `json:"notes,omitempty" yaml:"notes,omitempty"`
 	Tags              []string `json:"tags,omitempty" yaml:"tags,omitempty"`

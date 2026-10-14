@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jeffery/codex-quota-scheduler/testsupport"
+	"github.com/songka/cpa-plugin-codex-quota-reserve/testsupport"
 )
 
 func TestStateStoreAtomicOrderingAndLoad(t *testing.T) {

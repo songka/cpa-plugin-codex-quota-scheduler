@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 // Protocol names are the CPA wire formats the chain can be asked to carry. The
@@ -142,7 +142,7 @@ func executorIdentifier() ([]byte, error) {
 	return okEnvelope(map[string]any{"identifier": PluginID})
 }
 
-const retryExecutorUnsupported = "codex-quota-scheduler retry executor only serves streaming requests"
+const retryExecutorUnsupported = "codex-quota-reserve retry executor only serves streaming requests"
 
 // executeRetryChainStream starts the chain and returns headers immediately. The
 // orchestration goroutine owns the plugin stream and always closes it.
@@ -486,6 +486,16 @@ func runRetryAttempt(ctx context.Context, cfg Config, exec pluginapi.ExecutorReq
 
 // openNestedStream issues one nested execution through the host.
 func openNestedStream(cfg Config, exec pluginapi.ExecutorRequest, hostCallbackID string, state retryAttemptState, protocol string) (string, attemptResult, bool) {
+	authID, leaseID, admitErr := reserveNestedAdmit(cfg, state.target.Provider)
+	if admitErr != nil {
+		return "", attemptResult{reason: admitErr.Error()}, false
+	}
+	leaseTransferred := false
+	defer func() {
+		if !leaseTransferred && leaseID != "" {
+			globalReserveLedger.release(leaseID)
+		}
+	}()
 	body := retryAttemptBody(cfg, exec, state)
 	request := hostModelExecutionRequest{
 		HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{
@@ -498,6 +508,7 @@ func openNestedStream(cfg Config, exec pluginapi.ExecutorRequest, hostCallbackID
 			Query:          exec.Query,
 			Alt:            exec.Alt,
 			ForcedProvider: state.target.Provider,
+			AuthID:         authID,
 		},
 		HostCallbackID: hostCallbackID,
 	}
@@ -531,6 +542,10 @@ func openNestedStream(cfg Config, exec pluginapi.ExecutorRequest, hostCallbackID
 			kind:      retryKindTransport,
 			reason:    "host model stream bridge returned an empty stream id",
 		}, false
+	}
+	if leaseID != "" {
+		nestedReserveLeases.Store(streamID, leaseID)
+		leaseTransferred = true
 	}
 	return streamID, attemptResult{}, true
 }
@@ -735,6 +750,9 @@ func closePluginStream(streamID, errMsg string) {
 }
 
 func closeNestedStream(streamID string) {
+	if lease, ok := nestedReserveLeases.LoadAndDelete(streamID); ok {
+		globalReserveLedger.release(lease.(string))
+	}
 	if strings.TrimSpace(streamID) == "" {
 		return
 	}

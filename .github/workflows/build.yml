@@ -1,270 +1,83 @@
-name: Build
-
+name: Validate and package
 on:
   pull_request:
   push:
-    branches:
-      - main
-    tags:
-      - 'v*'
+    branches: [main]
+    tags: ['v*']
   workflow_dispatch:
-
 permissions:
-  contents: write
-
-env:
-  PLUGIN_NAME: codex-quota-scheduler
-
+  contents: read
 jobs:
   test:
-    name: Test
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Setup Go
-        uses: actions/setup-go@v6
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
-
-      - name: Test
-        run: make test
-
-      - name: Vet
-        run: make vet
-
-  build:
-    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+      - name: Formatting
+        run: test -z "$(gofmt -l $(git ls-files '*.go'))"
+      - run: make test vet
+      - run: go test -race -run '^TestReserve' -count=1 ./...
+      - name: Real CPA v8.0.27 dynamic integration
+        run: bash scripts/test-host-integration.sh
+  package:
     needs: test
-    runs-on: ${{ matrix.runner }}
     strategy:
-      fail-fast: false
       matrix:
         include:
-          - goos: linux
-            goarch: amd64
-            runner: ubuntu-24.04
-          - goos: linux
-            goarch: arm64
-            runner: ubuntu-24.04-arm
-          - goos: darwin
-            goarch: amd64
-            runner: macos-15-intel
-          - goos: darwin
-            goarch: arm64
-            runner: macos-15
-          - goos: windows
-            goarch: amd64
-            runner: windows-2025
-    defaults:
-      run:
-        shell: bash
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Setup Go
-        uses: actions/setup-go@v6
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
-
-      - name: Set up MinGW
-        if: runner.os == 'Windows'
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          path-type: inherit
-          update: true
-          install: >-
-            mingw-w64-x86_64-gcc
-            make
-
-      - name: Resolve release metadata
-        run: |
-          set -euo pipefail
-          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == v* ]]; then
-            VERSION="${GITHUB_REF_NAME#v}"
-          else
-            VERSION="0.0.0-dev"
-          fi
-          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
-          echo "ARCHIVE_NAME=${PLUGIN_NAME}_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.zip" >> "${GITHUB_ENV}"
-
-      - name: Build and package plugin
-        run: make package VERSION="${VERSION}" GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}"
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.ARCHIVE_NAME }}
-          path: |
-            dist/${{ env.ARCHIVE_NAME }}
-            dist/${{ env.ARCHIVE_NAME }}.sha256
-          if-no-files-found: error
-
-  build-windows-arm64:
-    name: Build windows/arm64
-    needs: test
-    runs-on: ubuntu-24.04
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Setup Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Resolve release metadata
-        id: release_metadata
-        run: |
-          set -euo pipefail
-          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == v* ]]; then
-            VERSION="${GITHUB_REF_NAME#v}"
-          else
-            VERSION="0.0.0-dev"
-          fi
-          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
-          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
-          echo "ARCHIVE_NAME=${PLUGIN_NAME}_${VERSION}_windows_arm64.zip" >> "${GITHUB_ENV}"
-
-      - name: Build Windows ARM64 shared library
-        timeout-minutes: 45
-        uses: go-cross/cgo-actions@v1
+      - name: Package
         env:
-          GOFLAGS: -trimpath -buildmode=c-shared
-        with:
-          dir: .
-          packages: .
-          targets: windows-arm64
-          out-dir: dist/windows-arm64
-          output: ${{ env.PLUGIN_NAME }}.dll
-          flags: -ldflags=-s -w
-          x-flags: main.pluginVersion=${{ steps.release_metadata.outputs.version }}
-
-      - name: Package plugin
+          RELEASE_REF: ${{ github.ref_name }}
+          RELEASE_TYPE: ${{ github.ref_type }}
         run: |
           set -euo pipefail
-          rm -f go-cross-bin.h "dist/windows-arm64/${PLUGIN_NAME}.h"
-          go run ./.github/scripts/package-release.go \
-            -library "dist/windows-arm64/${PLUGIN_NAME}.dll" \
-            -archive "dist/${ARCHIVE_NAME}" \
-            -checksum "dist/${ARCHIVE_NAME}.sha256"
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+          VERSION=0.1.0-dev
+          if [[ "$RELEASE_TYPE" == tag ]]; then VERSION="${RELEASE_REF#v}"; fi
+          make package VERSION="$VERSION"
+          cd dist
+          sha256sum -c *.zip.sha256
+          unzip -l *.zip
+      - uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.ARCHIVE_NAME }}
+          name: linux-${{ matrix.arch }}
           path: |
-            dist/${{ env.ARCHIVE_NAME }}
-            dist/${{ env.ARCHIVE_NAME }}.sha256
+            dist/*.zip
+            dist/*.sha256
           if-no-files-found: error
-
-  build-freebsd:
-    name: Build freebsd/amd64
-    needs: test
-    runs-on: ubuntu-24.04
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Setup Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Resolve release metadata
-        id: release_metadata
-        run: |
-          set -euo pipefail
-          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == v* ]]; then
-            VERSION="${GITHUB_REF_NAME#v}"
-          else
-            VERSION="0.0.0-dev"
-          fi
-          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
-          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
-          echo "ARCHIVE_NAME=${PLUGIN_NAME}_${VERSION}_freebsd_amd64.zip" >> "${GITHUB_ENV}"
-
-      - name: Build FreeBSD shared library
-        timeout-minutes: 45
-        env:
-          GOFLAGS: -trimpath -buildmode=c-shared
-        run: |
-          set -euo pipefail
-          # go-cross/cgo-actions hardcodes 14.3-RELEASE, which FreeBSD removed
-          # from its distribution servers. Replicate the action's freebsd
-          # engine (base.txz sysroot + clang cross build) against a release
-          # that is still downloadable. Bump FREEBSD_RELEASE when it is
-          # superseded and dropped from download.freebsd.org.
-          FREEBSD_RELEASE="14.5-RELEASE"
-          FREEBSD_TRIPLE="x86_64-unknown-freebsd14.5"
-          wget -q "https://download.freebsd.org/releases/amd64/${FREEBSD_RELEASE}/base.txz"
-          mkdir -p ./freebsd-sysroot dist/freebsd-amd64
-          sudo tar -xf ./base.txz -C ./freebsd-sysroot
-          rm -f ./base.txz
-          CGO_ENABLED=1 GOOS=freebsd GOARCH=amd64 \
-          CGO_LDFLAGS="-fuse-ld=lld" \
-          CC="clang --target=${FREEBSD_TRIPLE} --sysroot=$(pwd)/freebsd-sysroot" \
-            go build -o "dist/freebsd-amd64/${PLUGIN_NAME}.so" \
-            -ldflags="-s -w -X main.pluginVersion=${VERSION}" .
-
-      - name: Package plugin
-        run: |
-          set -euo pipefail
-          rm -f go-cross-bin.h "dist/freebsd-amd64/${PLUGIN_NAME}.h"
-          go run ./.github/scripts/package-release.go \
-            -library "dist/freebsd-amd64/${PLUGIN_NAME}.so" \
-            -archive "dist/${ARCHIVE_NAME}" \
-            -checksum "dist/${ARCHIVE_NAME}.sha256"
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.ARCHIVE_NAME }}
-          path: |
-            dist/${{ env.ARCHIVE_NAME }}
-            dist/${{ env.ARCHIVE_NAME }}.sha256
-          if-no-files-found: error
-
   release:
-    name: Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs:
-      - build
-      - build-windows-arm64
-      - build-freebsd
+    needs: [test, package]
+    environment: release-approval
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-
-      - name: Publish GitHub release
+      - name: Publish approved tag
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          sort dist/*.sha256 > dist/checksums.txt
-          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" dist/*.zip dist/checksums.txt --clobber --repo "${GITHUB_REPOSITORY}"
-          else
-            gh release create "${GITHUB_REF_NAME}" dist/*.zip dist/checksums.txt \
-              --repo "${GITHUB_REPOSITORY}" \
-              --verify-tag \
-              --title "${GITHUB_REF_NAME}" \
-              --notes "Automated release for ${GITHUB_REF_NAME}."
-          fi
+          cd dist
+          sha256sum -c *.zip.sha256
+          cat *.zip.sha256 > checksums.txt
+          gh release create "$RELEASE_TAG" *.zip checksums.txt --repo "$RELEASE_REPO" --verify-tag --title "Codex Quota Reserve $RELEASE_TAG" --generate-notes

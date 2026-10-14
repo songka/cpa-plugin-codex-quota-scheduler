@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jeffery/codex-quota-scheduler/testsupport"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+	"github.com/songka/cpa-plugin-codex-quota-reserve/testsupport"
 )
 
 type sequenceProbeHost struct {
@@ -1696,9 +1696,9 @@ func TestProbeLifecycleLogsNeverPersistArbitraryExternalCallbackText(t *testing.
 				t.Fatalf("%s injected callback error returned nil", stage)
 			}
 			for _, path := range []string{
-				"/v0/management/plugins/codex-quota-scheduler/status",
-				"/v0/management/plugins/codex-quota-scheduler/logs",
-				"/v0/management/plugins/codex-quota-scheduler/export",
+				"/v0/management/plugins/codex-quota-reserve/status",
+				"/v0/management/plugins/codex-quota-reserve/logs",
+				"/v0/management/plugins/codex-quota-reserve/export",
 			} {
 				resp := HandleManagementRequest(r.state, pluginapi.ManagementRequest{Method: http.MethodGet, Path: path, Headers: http.Header{"Authorization": []string{"Bearer management-key"}}, Query: url.Values{"format": []string{"json"}}}, now)
 				if resp.StatusCode != http.StatusOK {

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 // handleRequestComplete consumes the official per-request terminal events
@@ -20,6 +20,7 @@ func handleRequestComplete(raw []byte) ([]byte, error) {
 			return nil, err
 		}
 	}
+	globalReserveLedger.release(completion.RequestID)
 	handleRequestCompletionEvent(globalState, completion, time.Now())
 	return okEnvelope(struct{}{})
 }

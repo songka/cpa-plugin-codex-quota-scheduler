@@ -6,13 +6,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	"gopkg.in/yaml.v3"
 )
 
 const (
-	PluginID = "codex-quota-scheduler"
+	PluginID = "codex-quota-reserve"
 
 	chatGPTQuotaEndpoint = "https://chatgpt.com/backend-api/wham/usage"
 
@@ -22,13 +22,16 @@ const (
 	FallbackFillFirst FallbackMode = "fill-first"
 )
 
-var pluginVersion = "0.3.2"
+var pluginVersion = "0.1.0"
 
 type MonthlyMode string
 
 type FallbackMode string
 
 type Config struct {
+	ReservePolicy
+	TelemetryPolicy
+
 	HandleEnabled        bool
 	QuotaRefreshInterval time.Duration
 	// StaleAfter classifies cache age and permits pick-time recovery. It does
@@ -91,6 +94,7 @@ type registration struct {
 }
 
 type registrationCapabilities struct {
+	RequestInterceptor        bool `json:"request_interceptor"`
 	Scheduler                 bool `json:"scheduler"`
 	UsagePlugin               bool `json:"usage_plugin"`
 	ManagementAPI             bool `json:"management_api"`
@@ -111,6 +115,9 @@ type registrationCapabilities struct {
 }
 
 type rawConfig struct {
+	ReserveInput   `yaml:",inline"`
+	TelemetryInput `yaml:",inline"`
+
 	HandleEnabled                   *bool  `yaml:"handle_enabled"`
 	QuotaRefreshInterval            string `yaml:"quota_refresh_interval"`
 	StaleAfter                      string `yaml:"stale_after"`
@@ -150,6 +157,8 @@ type rawConfig struct {
 
 func DefaultConfig() Config {
 	return Config{
+		ReservePolicy:                   DefaultReservePolicy(),
+		TelemetryPolicy:                 defaultTelemetryPolicy(),
 		HandleEnabled:                   true,
 		QuotaRefreshInterval:            30 * time.Minute,
 		StaleAfter:                      5 * time.Hour,
@@ -266,6 +275,13 @@ func DecodeConfig(raw []byte) (Config, error) {
 	if err := yaml.Unmarshal(raw, &decoded); err != nil {
 		return Config{}, err
 	}
+	if err := applyTelemetryInput(&cfg.TelemetryPolicy, decoded.TelemetryInput); err != nil {
+		return Config{}, err
+	}
+	if err := applyReserveInput(&cfg.ReservePolicy, decoded.ReserveInput); err != nil {
+		return Config{}, err
+	}
+
 	if decoded.HandleEnabled != nil {
 		cfg.HandleEnabled = *decoded.HandleEnabled
 	}
@@ -573,10 +589,11 @@ func PluginRegistration() registration {
 			Name:             PluginID,
 			Version:          pluginVersion,
 			Author:           "Jeffery",
-			GitHubRepository: "https://github.com/JefferyZhang2019/cpa-plugin-codex-quota-scheduler",
+			GitHubRepository: "https://github.com/songka/cpa-plugin-codex-quota-reserve",
 			Logo:             "https://raw.githubusercontent.com/router-for-me/CLIProxyAPI/main/docs/logo.png",
 		},
 		Capabilities: registrationCapabilities{
+			RequestInterceptor:        true,
 			Scheduler:                 true,
 			UsagePlugin:               true,
 			ManagementAPI:             true,

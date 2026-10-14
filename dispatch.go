@@ -9,8 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 var (
@@ -47,6 +47,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		}
 		startGlobalRefresher()
 		return okEnvelope(PluginRegistration())
+	case pluginabi.MethodRequestInterceptBefore:
+		return okEnvelope(pluginapi.RequestInterceptResponse{})
+	case pluginabi.MethodRequestInterceptAfter:
+		return handleReserveIntercept(request)
 	case pluginabi.MethodSchedulerPick:
 		return handleSchedulerPick(request)
 	case pluginabi.MethodUsageHandle:
@@ -144,6 +148,7 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 	}
 	decision := schedulerPickPublished(req, time.Now())
 	return okEnvelope(pluginapi.SchedulerPickResponse{
+		Reject: decision.Reject, RejectCode: decision.RejectCode, RejectReason: decision.RejectReason,
 		AuthID:          decision.AuthID,
 		DelegateBuiltin: decision.DelegateBuiltin,
 		Handled:         decision.Handled,
@@ -293,7 +298,10 @@ func handleManagementHandle(raw []byte) ([]byte, error) {
 		lifecycle := ManagementLifecycleSnapshot{Roster: ActiveRoster{Capability: CapabilityB, Health: RosterWaiting}}
 		return okEnvelope(HandleManagementRequestWithLifecycle(globalState, req, now, lifecycle))
 	}
-	active, _ := rosterController.WakeForManagement(context.Background())
+	active, rosterErr := rosterController.WakeForManagement(context.Background())
+	if rosterErr != nil {
+		globalState.RecordLog("warn", "roster.sync_failed", "账号清单同步失败", map[string]any{"error": redactSecrets(rosterErr.Error())}, time.Now())
+	}
 	now := time.Now()
 	lifecycle := ManagementLifecycleSnapshot{Roster: active, CredentialAmbiguous: managementCredentialAmbiguous(refresher, active, now)}
 	if refresher != nil {

@@ -53,4 +53,4 @@ if (-not (Get-Command $ccCommand -ErrorAction SilentlyContinue)) {
 }
 
 go test ./...
-go build -buildmode=c-shared -o dist/codex-quota-scheduler.dll .
+go build -buildmode=c-shared -o dist/codex-quota-reserve.dll .

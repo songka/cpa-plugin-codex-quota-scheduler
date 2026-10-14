@@ -2,7 +2,7 @@ package main
 
 import (
 	"errors"
-	"github.com/jeffery/codex-quota-scheduler/testsupport"
+	"github.com/songka/cpa-plugin-codex-quota-reserve/testsupport"
 	"os"
 	"path/filepath"
 	"regexp"
