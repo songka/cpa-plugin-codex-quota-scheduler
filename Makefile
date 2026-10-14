@@ -1,5 +1,5 @@
-PLUGIN_NAME ?= codex-quota-scheduler
-VERSION ?= 0.3.2
+PLUGIN_NAME ?= codex-quota-reserve
+VERSION ?= 0.1.0
 BUILD_DIR ?= dist
 GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
@@ -31,7 +31,7 @@ vet:
 	go vet ./...
 
 package: build
-	go run ./.github/scripts/package-release.go -library "$(PLUGIN_OUTPUT)" -archive "$(ARCHIVE_PATH)" -checksum "$(CHECKSUM_PATH)"
+	GOOS= GOARCH= go run ./.github/scripts/package-release.go -library "$(PLUGIN_OUTPUT)" -archive "$(ARCHIVE_PATH)" -checksum "$(CHECKSUM_PATH)"
 
 checksums: package
 	cat $(BUILD_DIR)/*.zip.sha256 | sort -k 2 > "$(CHECKSUMS_PATH)"

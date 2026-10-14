@@ -58,7 +58,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 )
 
 var (
@@ -141,6 +141,7 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 		// Runtime persistence is an authorization prerequisite. Keep background
 		// work disabled rather than falling back to the legacy external-call path.
 		globalRefresher = nil
+		globalState.RecordLog("error", "runtime.init_failed", "运行时持久化初始化失败", map[string]any{"error": redactSecrets(err.Error())}, time.Now())
 	}
 	globalRosterController = NewRosterController(RosterControllerOptions{
 		Host: ABIHostAuthLister{},
@@ -213,6 +214,7 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 			_, _ = controller.Startup(context.Background())
 		}
 	}()
+	startReserveMonitor()
 	plugin.abi_version = C.uint32_t(pluginabi.ABIVersion)
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
 	plugin.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)
@@ -275,6 +277,7 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
+	stopReserveMonitor()
 	stopGlobalPickActivityPump()
 	refresherMu.Lock()
 	refresher := globalRefresher

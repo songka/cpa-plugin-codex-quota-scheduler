@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jeffery/codex-quota-scheduler/testsupport"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+	"github.com/songka/cpa-plugin-codex-quota-reserve/testsupport"
 )
 
 func TestRuntimeSemanticPathsAndLegacyMigration(t *testing.T) {

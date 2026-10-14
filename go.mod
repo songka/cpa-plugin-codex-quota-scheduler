@@ -1,8 +1,8 @@
-module github.com/jeffery/codex-quota-scheduler
+module github.com/songka/cpa-plugin-codex-quota-reserve
 
 go 1.26.0
 
 require (
-	github.com/router-for-me/CLIProxyAPI/v7 v7.3.8
+	github.com/router-for-me/CLIProxyAPI/v8 v8.0.27
 	gopkg.in/yaml.v3 v3.0.1
 )

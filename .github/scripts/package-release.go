@@ -77,6 +77,21 @@ func packageLibrary(libraryPath, archivePath string) ([]byte, error) {
 	if _, err := io.Copy(entry, library); err != nil {
 		return nil, fmt.Errorf("copy library: %w", err)
 	}
+	for _, noticePath := range []string{"LICENSE", "THIRD_PARTY_NOTICES.md", "licenses/CLIProxyAPI-MIT.txt", "licenses/yaml.v3-LICENSE.txt", "licenses/Go-LICENSE.txt"} {
+		notice, err := os.ReadFile(noticePath)
+		if err != nil {
+			return nil, fmt.Errorf("read required notice %s: %w", noticePath, err)
+		}
+		noticeHeader := &zip.FileHeader{Name: noticePath, Method: zip.Deflate}
+		noticeHeader.SetMode(0o644)
+		noticeEntry, err := writer.CreateHeader(noticeHeader)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := noticeEntry.Write(notice); err != nil {
+			return nil, err
+		}
+	}
 	if err := writer.Close(); err != nil {
 		return nil, fmt.Errorf("close zip writer: %w", err)
 	}

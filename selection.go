@@ -39,6 +39,17 @@ const (
 )
 
 type AccountView struct {
+	ReserveCapacity    float64
+	ReserveBudget      float64
+	ReserveMaxInFlight int
+	ReserveObservedAt  time.Time
+
+	ReserveValidUntil time.Time
+	ReserveFailClosed bool
+
+	ReserveBlocked bool
+	ReserveReason  string
+
 	ID                   string
 	AuthIndex            string
 	Instance             AuthInstanceID
@@ -72,6 +83,12 @@ type SelectionResult struct {
 }
 
 func ClassifyAccount(a AccountView, now time.Time) AvailabilityClass {
+	if a.ReserveFailClosed && !a.ReserveValidUntil.IsZero() && !now.Before(a.ReserveValidUntil) {
+		return Excluded
+	}
+	if a.ReserveBlocked {
+		return Excluded
+	}
 	if a.AuthBlocked || a.Circuit == CircuitOpen || a.TemporaryUnavailable || a.Trial != TrialNone {
 		return Excluded
 	}

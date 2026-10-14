@@ -1,0 +1,100 @@
+package pluginhost
+
+import (
+ "bytes"
+ "context"
+ "encoding/json"
+ "errors"
+ "fmt"
+ "io"
+ "net/http"
+ "net/http/httptest"
+ "os"
+ "path/filepath"
+ "strings"
+ "sync"
+ "testing"
+ "time"
+ "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+ coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+ coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+ "github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+ "gopkg.in/yaml.v3"
+)
+
+type reserveMockTransport struct {mu sync.Mutex;used map[string]float64}
+func (r *reserveMockTransport) RoundTrip(req *http.Request) (*http.Response,error) {
+ r.mu.Lock();defer r.mu.Unlock()
+ if req.URL.Host!="chatgpt.com" {return nil,fmt.Errorf("integration mock refuses external host")}
+ id:=req.Header.Get("Chatgpt-Account-Id");used:=r.used[id]
+ body:=fmt.Sprintf(`{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":%g,"limit_window_seconds":18000,"reset_at":%d},"secondary_window":{"used_percent":20,"limit_window_seconds":604800,"reset_at":%d}}}`,used,time.Now().Add(5*time.Hour).Unix(),time.Now().Add(7*24*time.Hour).Unix())
+ if strings.Contains(req.URL.Path,"reset-credits") {body=`{"available_count":0,"total_earned_count":0}`}
+ return &http.Response{StatusCode:200,Header:http.Header{"Content-Type":{"application/json"}},Body:io.NopCloser(strings.NewReader(body)),Request:req},nil
+}
+type reserveNoopExecutor struct{}
+func (reserveNoopExecutor) Identifier() string {return "codex"}
+func (reserveNoopExecutor) Execute(context.Context,*coreauth.Auth,coreexecutor.Request,coreexecutor.Options)(coreexecutor.Response,error) {return coreexecutor.Response{},nil}
+func (reserveNoopExecutor) ExecuteStream(context.Context,*coreauth.Auth,coreexecutor.Request,coreexecutor.Options)(*coreexecutor.StreamResult,error) {return nil,fmt.Errorf("unused")}
+func (reserveNoopExecutor) Refresh(_ context.Context,a *coreauth.Auth)(*coreauth.Auth,error) {return a,nil}
+func (reserveNoopExecutor) CountTokens(context.Context,*coreauth.Auth,coreexecutor.Request,coreexecutor.Options)(coreexecutor.Response,error) {return coreexecutor.Response{},nil}
+func (reserveNoopExecutor) HttpRequest(context.Context,*coreauth.Auth,*http.Request)(*http.Response,error) {return nil,fmt.Errorf("unused")}
+func TestReserveDynamicHostIntegration(t *testing.T) {
+ library:=os.Getenv("RESERVE_LIBRARY");if library=="" {t.Fatal("RESERVE_LIBRARY required; zero-test/skip is not validation")}
+ if os.Getenv("XDG_CONFIG_HOME")=="" {t.Fatal("XDG_CONFIG_HOME must be injected before launching the host process")}
+ if os.Getenv("RESERVE_EXPECT_RESTORED")=="1" {for _,name:=range []string{".user-data.json","quota-history.json"} {if _,err:=os.Stat(filepath.Join(os.Getenv("XDG_CONFIG_HOME"),"CLIProxyAPI","codex-quota-reserve",name));err!=nil {t.Fatalf("persisted state absent after container restart: %s: %v",name,err)}}}
+ transport:=&reserveMockTransport{used:map[string]float64{"a":90,"b":20}}
+ originalTransport:=http.DefaultTransport;http.DefaultTransport=transport;t.Cleanup(func(){http.DefaultTransport=originalTransport})
+ dir:=t.TempDir();raw,err:=os.ReadFile(library);if err!=nil {t.Fatal(err)};if err=os.WriteFile(filepath.Join(dir,"codex-quota-reserve.so"),raw,0755);err!=nil {t.Fatal(err)}
+ authDir:=t.TempDir();affinity:=coreauth.NewSessionAffinitySelector(&coreauth.FillFirstSelector{})
+ manager:=coreauth.NewManager(nil,affinity,nil)
+ manager.RegisterExecutor(reserveNoopExecutor{})
+ for _,id:=range []string{"a","b"} {
+  doc:=map[string]any{"type":"codex","access_token":"integration-fixture-token","account_id":id,"expired":time.Now().Add(24*time.Hour).Format(time.RFC3339)}
+  raw,_:=json.Marshal(doc);path:=filepath.Join(authDir,id+".json");if err:=os.WriteFile(path,raw,0600);err!=nil {t.Fatal(err)}
+  a:=&coreauth.Auth{ID:id+".json",Provider:"codex",FileName:id+".json",Status:coreauth.StatusActive,Metadata:doc,Attributes:map[string]string{"path":path,"source":path}}
+  a.EnsureIndex();if _,err:=manager.Register(context.Background(),a);err!=nil {t.Fatal(err)}
+ }
+ host:=New();host.SetAuthManager(manager);manager.SetPluginScheduler(host);defer host.ShutdownAll()
+ var cfg config.Config
+ if err:=yaml.Unmarshal([]byte(fmt.Sprintf("auth-dir: %s\nplugins:\n  enabled: true\n  dir: %s\n  configs:\n    codex-quota-reserve:\n      enabled: true\n      reserve_enabled: true\n      quota_refresh_interval: 5m\n      history_enabled: true\n",authDir,dir)),&cfg);err!=nil {t.Fatal(err)}
+ 
+ host.ApplyConfig(context.Background(),&cfg)
+ deadline:=time.Now().Add(15*time.Second)
+ for len(host.RegisteredPlugins())!=1 && time.Now().Before(deadline) {time.Sleep(20*time.Millisecond)}
+ if plugins:=host.RegisteredPlugins();len(plugins)!=1 || plugins[0].Metadata.Version!="0.1.0" {t.Fatalf("dynamic loading failed: %+v",plugins)}
+ host.RegisterManagementRoutes(context.Background(),nil)
+ call:=func(method,path string,body []byte) *httptest.ResponseRecorder {t.Helper();rr:=httptest.NewRecorder();req:=httptest.NewRequest(method,"http://host/v0/management/plugins/codex-quota-reserve"+path,bytes.NewReader(body));if !host.ServeManagementHTTP(rr,req) {t.Fatalf("management route absent %s",path)};return rr}
+ call("POST","/refresh",nil)
+ var status struct {Accounts []struct {AuthID string `json:"auth_id"`;Reserve struct {Reason string `json:"reason"`} `json:"reserve"`} `json:"accounts"`}
+ for time.Now().Before(deadline) {rr:=call("GET","/status?format=json",nil);if err:=json.Unmarshal(rr.Body.Bytes(),&status);err==nil && len(status.Accounts)==2 {ready:=0;for _,a:=range status.Accounts {if a.Reserve.Reason=="normal" || a.Reserve.Reason=="reserve_five_hour" {ready++}};if ready==2 {break}};time.Sleep(50*time.Millisecond)}
+ if len(status.Accounts)!=2 {t.Fatalf("quota/status not ready: %+v body=%s",status,call("GET","/status?format=json",nil).Body.String())}
+ req:=pluginapi.SchedulerPickRequest{Provider:"codex",Candidates:[]pluginapi.SchedulerAuthCandidate{{ID:"a.json",Provider:"codex",Priority:10},{ID:"b.json",Provider:"codex",Priority:0}}}
+ pick,handled,err:=host.PickAuth(context.Background(),req);if err!=nil || !handled || pick.AuthID!="b.json" {t.Fatalf("safe lower tier not selected: %+v handled=%v err=%v status=%+v",pick,handled,err,status)}
+
+ opts:=coreexecutor.Options{Metadata:map[string]any{"execution_session_id":"reserve-test-session"}}
+ // Seed an affinity binding to the protected auth, then exercise the real
+ // Manager with the dynamically loaded plugin as its scheduler.
+ for _,auth:=range manager.List() {if auth.ID=="a.json" {_,_ = affinity.Pick(context.Background(),"codex","",opts,[]*coreauth.Auth{auth})}}
+ selected,selectErr:=manager.SelectAuth(context.Background(),"codex","",opts)
+ if selectErr!=nil || selected==nil || selected.ID!="b.json" {t.Fatalf("affinity bypassed actual reserve scheduler: %+v %v",selected,selectErr)}
+ // A pinned/session-like path which bypasses the scheduler must be stopped by
+ // the actual host request interceptor, without attempting upstream execution.
+ intercept:=host.InterceptRequestAfterAuth(context.Background(),pluginapi.RequestInterceptRequest{RequestID:"protected",ToFormat:"codex",Metadata:map[string]any{"selected_auth_id":"a.json"}})
+ if !intercept.Terminate || intercept.StatusCode!=503 {t.Fatalf("protected pinned request bypass: %+v",intercept)}
+ safe:=host.InterceptRequestAfterAuth(context.Background(),pluginapi.RequestInterceptRequest{RequestID:"safe",ToFormat:"codex",Metadata:map[string]any{"selected_auth_id":"b.json"}});if safe.Terminate {t.Fatalf("safe request rejected: %+v",safe)}
+ concurrent:=host.InterceptRequestAfterAuth(context.Background(),pluginapi.RequestInterceptRequest{RequestID:"concurrent",ToFormat:"codex",Metadata:map[string]any{"selected_auth_id":"b.json"}});if !concurrent.Terminate {t.Fatal("concurrency bypass")}
+ host.CompleteRequest(context.Background(),pluginapi.RequestCompletion{RequestID:"safe",Outcome:pluginapi.RequestCompletionSucceeded})
+ transport.mu.Lock();transport.used["b"]=90;transport.mu.Unlock();call("POST","/refresh",nil)
+ for time.Now().Before(deadline) {pick,handled,err=host.PickAuth(context.Background(),req);if pick.Reject {break};time.Sleep(50*time.Millisecond)}
+ if err!=nil || !handled || !pick.Reject || pick.AuthID!="" || pick.DelegateBuiltin!="" || pick.RejectCode!="quota_reserve_unavailable" {t.Fatalf("terminal rejection bypass: %+v handled=%v err=%v",pick,handled,err)}
+
+ selected,selectErr=manager.SelectAuth(context.Background(),"codex","",opts)
+ var reserveError *coreauth.Error
+ if selected!=nil || !errors.As(selectErr,&reserveError) || reserveError.Code!="quota_reserve_unavailable" {t.Fatalf("actual Manager builtin fallback bypass: %+v %v",selected,selectErr)}
+ settings:=call("GET","/settings",nil);if !bytes.Contains(settings.Body.Bytes(),[]byte(`"reserve_enabled":true`)) {t.Fatalf("settings missing %s",settings.Body.String())}
+ history:=call("GET","/history",nil);if history.Code!=200 || !bytes.Contains(history.Body.Bytes(),[]byte(`"a.json"`)) {t.Fatalf("history missing %s",history.Body.String())}
+ exported:=call("GET","/export",nil);if exported.Code!=200 {t.Fatal("export")};if rr:=call("POST","/import",exported.Body.Bytes());rr.Code!=200 {t.Fatalf("import: %s",rr.Body.String())}
+ // The host's own Manager terminal-rejection tests exercise the builtin
+ // fallback boundary; this test additionally loads and calls the real library.
+ t.Log("dynamic ABI, quota parsing, cross-priority selection, pinned guard, concurrency, strict rejection, settings/history/import/export passed")
+}

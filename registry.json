@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "codex-quota-reserve",
+      "name": "Codex Quota Reserve",
+      "description": "Codex OAuth quota reserve protection, quota-aware Fill First scheduling, history and optional webhook alerts. Requires CPA v8.0.27.",
+      "author": "songka; based on Jeffery's Codex Quota Scheduler",
+      "repository": "https://github.com/songka/cpa-plugin-codex-quota-reserve",
+      "homepage": "https://github.com/songka/cpa-plugin-codex-quota-reserve",
+      "license": "MIT",
+      "tags": ["Scheduler", "Codex", "Quota", "Management", "Notification"]
+    }
+  ]
+}

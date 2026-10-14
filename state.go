@@ -8,6 +8,8 @@ import (
 )
 
 type PluginState struct {
+	history *quotaHistory
+
 	mu                  sync.RWMutex
 	cfg                 Config
 	accounts            map[string]AccountState
@@ -24,6 +26,7 @@ type PluginState struct {
 
 func NewPluginState(cfg Config) *PluginState {
 	return &PluginState{
+		history:     newQuotaHistory(),
 		cfg:         NormalizeConfig(cfg),
 		accounts:    make(map[string]AccountState),
 		annotations: NormalizeAnnotationState(AnnotationState{}),
@@ -1001,6 +1004,12 @@ func cloneAnnotationState(state AnnotationState) AnnotationState {
 }
 
 func cloneAccountAnnotation(annotation AccountAnnotation) AccountAnnotation {
+	if annotation.ReserveOverride != nil {
+		o := *annotation.ReserveOverride
+		o.FiveHour = cloneFloat64Ptr(o.FiveHour)
+		o.LongWindow = cloneFloat64Ptr(o.LongWindow)
+		annotation.ReserveOverride = &o
+	}
 	annotation.Tags = cloneStringSlice(annotation.Tags)
 	return annotation
 }

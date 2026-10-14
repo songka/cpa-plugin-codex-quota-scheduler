@@ -7,10 +7,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 type SchedulerSnapshot struct {
+	ReserveEnabled bool
+	ReserveStrict  bool
+
 	HandleEnabled     bool
 	Fallback          FallbackMode
 	MonthlyMode       MonthlyMode
@@ -69,6 +72,16 @@ func schedulerPickPublished(req pluginapi.SchedulerPickRequest, now time.Time) P
 	for _, c := range req.Candidates {
 		candidates = append(candidates, Candidate{ID: c.ID, Provider: c.Provider})
 	}
+	local := cloneSchedulerSnapshot(*snapshot)
+	if local.ReserveEnabled {
+		for i, a := range local.Accounts {
+			if !globalReserveLedger.selectable(a) {
+				local.Accounts[i].ReserveBlocked = true
+				local.Accounts[i].ReserveReason = "reserve_concurrency_or_budget"
+			}
+		}
+	}
+	snapshot = &local
 	result := selectAccountSkipping(*snapshot, candidates, now, nil, snapshot.Trials)
 	var skipped map[AuthInstanceID]struct{}
 	for result.AuthID != "" && result.Class == Opportunistic && (snapshot.Trials == nil || !snapshot.Trials.TryBegin(result.Instance, now)) {
@@ -87,6 +100,9 @@ func schedulerPickPublished(req pluginapi.SchedulerPickRequest, now time.Time) P
 	}
 	if result.AuthID != "" {
 		return observeSchedulerDecision(snapshot, req, PickDecision{AuthID: result.AuthID, Handled: true, Reason: "selected"}, now)
+	}
+	if snapshot.ReserveEnabled && snapshot.ReserveStrict {
+		return observeSchedulerDecision(snapshot, req, reserveRejectDecision(), now)
 	}
 	if snapshot.Fallback == FallbackFillFirst {
 		return observeSchedulerDecision(snapshot, req, PickDecision{Handled: true, DelegateBuiltin: pluginapi.SchedulerBuiltinFillFirst, Reason: result.Reason, UnavailableSummary: fallbackUnavailableSummary(*snapshot, candidates, now)}, now)
@@ -128,6 +144,8 @@ func fallbackUnavailableSummary(snapshot SchedulerSnapshot, candidates []Candida
 
 func accountExclusionReason(a AccountView, now time.Time) string {
 	switch {
+	case a.ReserveBlocked:
+		return a.ReserveReason
 	case a.AuthBlocked:
 		return "auth_failure"
 	case a.Circuit == CircuitOpen:
@@ -166,7 +184,7 @@ func schedulerSnapshotFromState(state StateSnapshot, trials *TrialRegistry) *Sch
 		activity = pump.enqueue
 		observation = pump.enqueueObservation
 	}
-	return &SchedulerSnapshot{HandleEnabled: state.Config.HandleEnabled, Fallback: state.Config.Fallback, MonthlyMode: state.Config.MonthlyMode, Accounts: accounts, ActiveHighestTier: active, Trials: trials, EvidenceIntents: globalEvidenceIntents, Activity: activity, Observation: observation}
+	return &SchedulerSnapshot{ReserveEnabled: state.Config.ReserveEnabled, ReserveStrict: state.Config.ReserveStrict, HandleEnabled: state.Config.HandleEnabled, Fallback: state.Config.Fallback, MonthlyMode: state.Config.MonthlyMode, Accounts: accounts, ActiveHighestTier: active, Trials: trials, EvidenceIntents: globalEvidenceIntents, Activity: activity, Observation: observation}
 }
 
 func accountViewFromState(a AccountState, cfg Config, now time.Time, trials *TrialRegistry) AccountView {
@@ -190,7 +208,24 @@ func accountViewFromState(a AccountState, cfg Config, now time.Time, trials *Tri
 	} else if circuit == CircuitStateHalfOpen {
 		circuitClass = CircuitHalfOpen
 	}
+	reserve := evaluateReserve(a, cfg, now)
+	capacity := 100.0
+	if cfg.ReserveEnabled {
+		for _, w := range []struct {
+			q    *QuotaWindow
+			line float64
+		}{{a.Quota.FiveHour, reserve.FiveHourStopLine}, {a.Quota.LongWindow, reserve.LongStopLine}} {
+			if w.q != nil && w.q.UsedPercent != nil {
+				distance := 100 - *w.q.UsedPercent - w.line
+				if distance < capacity {
+					capacity = distance
+				}
+			}
+		}
+	}
 	return AccountView{
+		ReserveCapacity: capacity, ReserveBudget: cfg.ReserveRequestBudgetPercent, ReserveMaxInFlight: cfg.ReserveMaxInFlight, ReserveObservedAt: a.LastSuccessAt,
+		ReserveBlocked: reserve.Blocked, ReserveReason: reserve.Reason, ReserveValidUntil: reserve.ValidUntil, ReserveFailClosed: cfg.ReserveEnabled && cfg.ReserveFailClosed,
 		ID: a.AuthID, AuthIndex: a.AuthIndex, Instance: a.Instance,
 		PluginPriority: a.Annotation.SchedulerPriority, CPAPriority: a.Priority, Family: a.Family,
 		Cache: cache, LastKnownAvailable: a.LastError == "", Exhausted: exhausted,
