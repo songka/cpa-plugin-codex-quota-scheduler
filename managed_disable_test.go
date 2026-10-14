@@ -219,3 +219,107 @@ func TestManagedQuotaRecoveryKeepsAccountWhenFiveHourStillExhausted(t *testing.T
 		t.Fatal("recovery enabled an account whose five-hour window is still exhausted")
 	}
 }
+
+func TestManagedQuotaRecoveryGuardIgnoresOldReserveObservation(t *testing.T) {
+	now := time.Date(2026, 9, 20, 9, 0, 0, 0, time.UTC)
+	cfg := DefaultConfig()
+	cfg.EnableManagedQuotaDisable = true
+	cfg.ReserveEnabled = true
+	cfg.ReserveDisableAccounts = true
+	r, host, store := managedDisableTestRefresher(t, now, cfg)
+	store.ReplaceCPAAdmission(CPAAdmissionState{Observed: true, AuthIDs: map[string]struct{}{"team": {}}})
+
+	if err := r.ApplyManagedQuotaDisable(context.Background(), QuotaFailureEvent{
+		AuthID: "team", AuthIndex: "idx-team", ResetAt: now, Reason: usageLimitReachedReason,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	host.authJSON["idx-team"] = host.saved["idx-team.json"]
+	host.httpBody = []byte(`{"rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_after_seconds":18000},"secondary_window":{"used_percent":5,"limit_window_seconds":604800,"reset_after_seconds":86400}}}`)
+	if err := r.requestManagedRecovery("team"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.RecoverManagedQuotaAccounts(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	host.authJSON["idx-team"] = host.saved["idx-team.json"]
+	if _, err := r.runtimeStore.PersistentSnapshot(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The old refresh result still says the account is exhausted. It must not
+	// immediately disable the credential that recovery just enabled.
+	exhausted := 100.0
+	store.UpsertQuota(AccountState{
+		AuthID:        "team",
+		AuthIndex:     "idx-team",
+		Provider:      "codex",
+		LastSuccessAt: now,
+		Quota: ParsedQuota{
+			FiveHour:   &QuotaWindow{Kind: WindowFiveHour, UsedPercent: &exhausted, ResetAt: now.Add(time.Hour)},
+			LongWindow: &QuotaWindow{Kind: WindowWeekly, UsedPercent: reserveFloat(5), ResetAt: now.Add(24 * time.Hour)},
+		},
+	})
+	if err := r.ApplyReserveQuotaDisables(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	persisted, _ := r.runtimeStore.PersistentSnapshot()
+	if _, exists := persisted.ManagedLifecycle["idx-team"]; exists {
+		t.Fatal("old quota observation re-disabled the recovered account")
+	}
+	if !strings.Contains(string(host.saved["idx-team.json"]), `"disabled":false`) {
+		t.Fatalf("recovery write was overwritten: %s", host.saved["idx-team.json"])
+	}
+}
+
+func TestManagedQuotaRecoveryGuardReleasesForNewObservationAndCanDisableAgain(t *testing.T) {
+	now := time.Date(2026, 9, 20, 9, 0, 0, 0, time.UTC)
+	cfg := DefaultConfig()
+	cfg.EnableManagedQuotaDisable = true
+	cfg.ReserveEnabled = true
+	cfg.ReserveDisableAccounts = true
+	r, host, store := managedDisableTestRefresher(t, now, cfg)
+	store.ReplaceCPAAdmission(CPAAdmissionState{Observed: true, AuthIDs: map[string]struct{}{"team": {}}})
+
+	if err := r.ApplyManagedQuotaDisable(context.Background(), QuotaFailureEvent{
+		AuthID: "team", AuthIndex: "idx-team", ResetAt: now, Reason: usageLimitReachedReason,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	host.authJSON["idx-team"] = host.saved["idx-team.json"]
+	host.httpBody = []byte(`{"rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_after_seconds":18000},"secondary_window":{"used_percent":5,"limit_window_seconds":604800,"reset_after_seconds":86400}}}`)
+	if err := r.requestManagedRecovery("team"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.RecoverManagedQuotaAccounts(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	host.authJSON["idx-team"] = host.saved["idx-team.json"]
+
+	later := now.Add(time.Minute)
+	r.now = func() time.Time { return later }
+	exhausted := 100.0
+	store.UpsertQuota(AccountState{
+		AuthID:        "team",
+		AuthIndex:     "idx-team",
+		Provider:      "codex",
+		LastSuccessAt: later,
+		Quota: ParsedQuota{
+			FiveHour:   &QuotaWindow{Kind: WindowFiveHour, UsedPercent: &exhausted, ResetAt: later.Add(time.Hour)},
+			LongWindow: &QuotaWindow{Kind: WindowWeekly, UsedPercent: reserveFloat(5), ResetAt: later.Add(24 * time.Hour)},
+		},
+	})
+	if err := r.ApplyReserveQuotaDisables(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	persisted, _ := r.runtimeStore.PersistentSnapshot()
+	if _, exists := persisted.ManagedRecoveryGuards["idx-team"]; exists {
+		t.Fatal("new quota observation did not release recovery guard")
+	}
+	if record, exists := persisted.ManagedLifecycle["idx-team"]; !exists || !record.DisableApplied {
+		t.Fatalf("new exhausted observation did not re-disable account: %#v", record)
+	}
+	if !strings.Contains(string(host.saved["idx-team.json"]), `"disabled":true`) {
+		t.Fatalf("account was not disabled again: %s", host.saved["idx-team.json"])
+	}
+}

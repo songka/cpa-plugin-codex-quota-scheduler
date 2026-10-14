@@ -15,19 +15,20 @@ const CurrentStateSchema = 2
 var ErrStateReadOnly = errors.New("state store is read-only")
 
 type PersistentState struct {
-	SchemaVersion       int                                                `json:"schema_version"`
-	ReservedCeiling     uint64                                             `json:"reserved_ceiling"`
-	NextSaveSeq         uint64                                             `json:"next_save_seq"`
-	TierGeneration      TierGeneration                                     `json:"tier_generation,omitempty"`
-	AdmissionEpochs     map[AuthInstanceID]InstanceAdmissionEpoch          `json:"admission_epochs,omitempty"`
-	CredentialChains    map[AuthInstanceID]TransitionChain                 `json:"credential_chains,omitempty"`
-	FenceUnsafe         bool                                               `json:"fence_unsafe,omitempty"`
-	Bindings            map[string]RuntimeBinding                          `json:"bindings,omitempty"`
-	ProbeAttempts       map[AuthInstanceID]ProbeAttemptSeam                `json:"probe_attempts,omitempty"`
-	ProbeAttemptSeq     uint64                                             `json:"probe_attempt_seq,omitempty"`
-	ProbeWindows        map[AuthInstanceID]map[ProbeWindowKind]ProbeWindow `json:"probe_windows,omitempty"`
-	LastConfirmedRoster *PersistedConfirmedRoster                          `json:"last_confirmed_roster,omitempty"`
-	ManagedLifecycle    map[string]ManagedDisableRecord                    `json:"managed_lifecycle,omitempty"`
+	SchemaVersion         int                                                `json:"schema_version"`
+	ReservedCeiling       uint64                                             `json:"reserved_ceiling"`
+	NextSaveSeq           uint64                                             `json:"next_save_seq"`
+	TierGeneration        TierGeneration                                     `json:"tier_generation,omitempty"`
+	AdmissionEpochs       map[AuthInstanceID]InstanceAdmissionEpoch          `json:"admission_epochs,omitempty"`
+	CredentialChains      map[AuthInstanceID]TransitionChain                 `json:"credential_chains,omitempty"`
+	FenceUnsafe           bool                                               `json:"fence_unsafe,omitempty"`
+	Bindings              map[string]RuntimeBinding                          `json:"bindings,omitempty"`
+	ProbeAttempts         map[AuthInstanceID]ProbeAttemptSeam                `json:"probe_attempts,omitempty"`
+	ProbeAttemptSeq       uint64                                             `json:"probe_attempt_seq,omitempty"`
+	ProbeWindows          map[AuthInstanceID]map[ProbeWindowKind]ProbeWindow `json:"probe_windows,omitempty"`
+	LastConfirmedRoster   *PersistedConfirmedRoster                          `json:"last_confirmed_roster,omitempty"`
+	ManagedLifecycle      map[string]ManagedDisableRecord                    `json:"managed_lifecycle,omitempty"`
+	ManagedRecoveryGuards map[string]ManagedRecoveryGuard                    `json:"managed_recovery_guards,omitempty"`
 }
 
 type PersistedRosterEntry struct {
@@ -44,7 +45,7 @@ type PersistedConfirmedRoster struct {
 }
 
 func NewPersistentState() PersistentState {
-	return PersistentState{SchemaVersion: CurrentStateSchema, AdmissionEpochs: map[AuthInstanceID]InstanceAdmissionEpoch{}, CredentialChains: map[AuthInstanceID]TransitionChain{}, Bindings: map[string]RuntimeBinding{}, ProbeAttempts: map[AuthInstanceID]ProbeAttemptSeam{}, ProbeWindows: map[AuthInstanceID]map[ProbeWindowKind]ProbeWindow{}, ManagedLifecycle: map[string]ManagedDisableRecord{}}
+	return PersistentState{SchemaVersion: CurrentStateSchema, AdmissionEpochs: map[AuthInstanceID]InstanceAdmissionEpoch{}, CredentialChains: map[AuthInstanceID]TransitionChain{}, Bindings: map[string]RuntimeBinding{}, ProbeAttempts: map[AuthInstanceID]ProbeAttemptSeam{}, ProbeWindows: map[AuthInstanceID]map[ProbeWindowKind]ProbeWindow{}, ManagedLifecycle: map[string]ManagedDisableRecord{}, ManagedRecoveryGuards: map[string]ManagedRecoveryGuard{}}
 }
 func clonePersistentState(s PersistentState) PersistentState {
 	raw, _ := json.Marshal(s)
@@ -56,6 +57,9 @@ func clonePersistentState(s PersistentState) PersistentState {
 	}
 	if out.ManagedLifecycle == nil {
 		out.ManagedLifecycle = map[string]ManagedDisableRecord{}
+	}
+	if out.ManagedRecoveryGuards == nil {
+		out.ManagedRecoveryGuards = map[string]ManagedRecoveryGuard{}
 	}
 	if out.CredentialChains == nil {
 		out.CredentialChains = map[AuthInstanceID]TransitionChain{}
@@ -196,6 +200,12 @@ func (s *StateStore) loadLocked() (PersistentState, RecoveryReport, error) {
 	if state.ProbeWindows == nil {
 		state.ProbeWindows = map[AuthInstanceID]map[ProbeWindowKind]ProbeWindow{}
 	}
+	if state.ManagedLifecycle == nil {
+		state.ManagedLifecycle = map[string]ManagedDisableRecord{}
+	}
+	if state.ManagedRecoveryGuards == nil {
+		state.ManagedRecoveryGuards = map[string]ManagedRecoveryGuard{}
+	}
 	s.state = state
 	s.loaded = true
 	if state.FenceUnsafe {
@@ -322,6 +332,12 @@ func (s *StateStore) writeLockedMode(state PersistentState, mirrorBackup bool) e
 	}
 	if state.ProbeWindows == nil {
 		state.ProbeWindows = map[AuthInstanceID]map[ProbeWindowKind]ProbeWindow{}
+	}
+	if state.ManagedLifecycle == nil {
+		state.ManagedLifecycle = map[string]ManagedDisableRecord{}
+	}
+	if state.ManagedRecoveryGuards == nil {
+		state.ManagedRecoveryGuards = map[string]ManagedRecoveryGuard{}
 	}
 	raw, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {

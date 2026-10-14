@@ -53,6 +53,13 @@ type ManagedDisableRecord struct {
 	Events           []LifecycleEvent        `json:"events,omitempty"`
 }
 
+// ManagedRecoveryGuard suppresses a quota decision made from an observation
+// that may have started before the plugin re-enabled the credential.
+type ManagedRecoveryGuard struct {
+	Fingerprint CredentialFingerprint `json:"fingerprint,omitempty"`
+	RecoveredAt time.Time             `json:"recovered_at"`
+}
+
 // Keep non-secret quota evidence after CPA removes a disabled auth from admission.
 type ManagedAccountSnapshot struct {
 	AuthID     string            `json:"auth_id"`
@@ -107,6 +114,16 @@ func (r *QuotaRefresher) ApplyReserveQuotaDisables(ctx context.Context) error {
 		}
 		if _, owned := persisted.ManagedLifecycle[a.AuthIndex]; owned {
 			continue
+		}
+		if guard, guarded := persisted.ManagedRecoveryGuards[a.AuthIndex]; guarded {
+			blocked, guardErr := r.recoveryGuardBlocksReserveDisable(a, guard)
+			if guardErr != nil {
+				failures = append(failures, guardErr)
+				continue
+			}
+			if blocked {
+				continue
+			}
 		}
 		if a.LastSuccessAt.IsZero() || a.LastSuccessAt.After(snap.Now) || a.Stale || snap.Now.Sub(a.LastSuccessAt) > snap.Config.QuotaRefreshInterval {
 			continue
@@ -530,6 +547,10 @@ func (r *QuotaRefresher) recoverManagedQuotaAccount(ctx context.Context, authInd
 	}
 	_, err = r.runtimeStore.Update(func(state *PersistentState) error {
 		delete(state.ManagedLifecycle, authIndex)
+		state.ManagedRecoveryGuards[authIndex] = ManagedRecoveryGuard{
+			Fingerprint: record.Fingerprint,
+			RecoveredAt: r.now(),
+		}
 		return nil
 	})
 	if err == nil {
@@ -544,6 +565,38 @@ func (r *QuotaRefresher) recoverManagedQuotaAccount(ctx context.Context, authInd
 		r.wakeRefreshLoop()
 	}
 	return err
+}
+
+// recoveryGuardBlocksReserveDisable verifies the credential before deciding
+// whether the cached quota observation is new enough to use again.
+func (r *QuotaRefresher) recoveryGuardBlocksReserveDisable(account AccountState, guard ManagedRecoveryGuard) (bool, error) {
+	if !guard.Fingerprint.ValidHashes() {
+		return true, nil
+	}
+	response, err := r.host.GetAuth(account.AuthIndex)
+	if err != nil {
+		return true, nil
+	}
+	credentials, err := ExtractCodexCredentials(response.JSON)
+	if err != nil {
+		return true, nil
+	}
+	fingerprint := managedAuthFingerprint(account.AuthIndex, credentials)
+	if fingerprint != guard.Fingerprint {
+		_, err := r.runtimeStore.Update(func(state *PersistentState) error {
+			delete(state.ManagedRecoveryGuards, account.AuthIndex)
+			return nil
+		})
+		return false, err
+	}
+	if !account.LastSuccessAt.After(guard.RecoveredAt) {
+		return true, nil
+	}
+	_, err = r.runtimeStore.Update(func(state *PersistentState) error {
+		delete(state.ManagedRecoveryGuards, account.AuthIndex)
+		return nil
+	})
+	return false, err
 }
 
 func (r *QuotaRefresher) recordManagedQuotaCheck(authIndex string, at time.Time) error {
