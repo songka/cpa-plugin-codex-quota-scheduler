@@ -1,6 +1,6 @@
 # Codex Quota Reserve 安装与回滚手册
 
-独立插件 ID：`codex-quota-reserve`。目标宿主：**CLIProxyAPI v8.0.27**。开发版本：**0.1.0**。目前未获批准发布正式版本。
+独立插件 ID：`codex-quota-reserve`。目标宿主：**CLIProxyAPI v8.0.27**。发行版本：**0.1.0**。发布仓库：`songka/cpa-plugin-codex-quota-scheduler`。
 
 基于 Jeffery 的 MIT Codex Quota Scheduler v0.3.2 改造。[原版中文说明](docs/upstream/README.zh-CN.md)保留成熟功能的详细说明。
 
@@ -25,7 +25,7 @@ plugins:
   enabled: true
   dir: /data/plugins
   store-sources:
-    - https://raw.githubusercontent.com/songka/cpa-plugin-codex-quota-reserve/main/registry.json
+    - https://raw.githubusercontent.com/songka/cpa-plugin-codex-quota-scheduler/main/registry.json
   configs:
     codex-quota-scheduler:
       enabled: false
@@ -35,7 +35,7 @@ plugins:
       quota_refresh_interval: 5m
 ```
 
-上述新仓库和正式 Release 尚未创建，商店安装需要它们先存在。开发验收阶段可将经过 SHA256 检查的对应架构 `.so` 放入挂载的插件目录。文件名必须为 `codex-quota-reserve.so`。
+使用现有公开仓库发布；商店安装需要 v0.1.0 Release 中存在对应架构 ZIP 和 `checksums.txt`。开发验收阶段也可将经过 SHA256 检查的对应架构 `.so` 放入挂载的插件目录。文件名必须为 `codex-quota-reserve.so`。
 
 ## 迁移与启用
 
@@ -85,4 +85,4 @@ git tag -a v0.1.0 -m "v0.1.0"
 git push origin v0.1.0
 ```
 
-当前仍在原 fork 中开发；需先创建并迁移到独立公开发布仓库，才能使用 README 中的商店源。参阅[验证记录和限制](docs/reserve-validation.md)。原 [MIT 许可证](LICENSE)和版权保留；正式再分发前需核对依赖许可证。
+仓库沿用现有名称；插件 ID、动态库和发行 ZIP 基名仍为 `codex-quota-reserve`，保持独立运行身份。参阅[验证记录和限制](docs/reserve-validation.md)。原 [MIT 许可证](LICENSE)和版权保留；正式再分发前需核对依赖许可证。

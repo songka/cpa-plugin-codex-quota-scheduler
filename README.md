@@ -1,6 +1,6 @@
 # Codex Quota Reserve
 
-Independent CPA dynamic plugin `codex-quota-reserve`, targeting **CLIProxyAPI v8.0.27**, based on Jeffery's MIT Codex Quota Scheduler v0.3.2. Development version **0.1.0**; no stable release has been approved or published.
+Independent CPA dynamic plugin `codex-quota-reserve`, targeting **CLIProxyAPI v8.0.27**, based on Jeffery's MIT Codex Quota Scheduler v0.3.2. Release version **0.1.0**, distributed from the existing public repository `songka/cpa-plugin-codex-quota-scheduler`.
 
 [中文安装与回滚手册](README.zh-CN.md) · [Upstream documentation](docs/upstream/README.md)
 
@@ -62,10 +62,10 @@ With strict reserve enabled, retry targets with an empty provider use a pinned s
 
 ## Store and release
 
-`registry.json` uses the official store's actual schema 1: GitHub Release discovery supplies versions, platform assets and checksums. It deliberately does not advertise nonexistent assets or guessed hashes. The destination `songka/cpa-plugin-codex-quota-reserve` must exist publicly and contain the approved release before this source is installable:
+`registry.json` uses the official store's actual schema 1: GitHub Release discovery supplies versions, platform assets and checksums. It deliberately does not advertise nonexistent assets or guessed hashes. The existing public repository `songka/cpa-plugin-codex-quota-scheduler` is the selected publication destination. Installation requires its approved release and matching platform assets:
 
 ```
-https://raw.githubusercontent.com/songka/cpa-plugin-codex-quota-reserve/main/registry.json
+https://raw.githubusercontent.com/songka/cpa-plugin-codex-quota-scheduler/main/registry.json
 ```
 
 Set up GitHub Environment `release-approval` with required reviewers. Tags run full validation and both native builds before the release job. No tag or release should be created before explicit user approval. After approval only:
@@ -76,7 +76,7 @@ git tag -a v0.1.0 -m "v0.1.0"
 git push origin v0.1.0
 ```
 
-The current development repository remains the existing scheduler fork until the independent destination is created. Publishing a tag on that repository is not the final distribution workflow.
+The repository name is retained; the plugin ID and archive basename remain `codex-quota-reserve`, so the plugin keeps an independent runtime identity.
 
 ## License
 

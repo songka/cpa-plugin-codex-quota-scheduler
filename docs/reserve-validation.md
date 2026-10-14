@@ -1,6 +1,6 @@
 # Codex Quota Reserve validation and remaining limits
 
-Development branch: `feat/codex-quota-reserve-v0.1.0`. No production CPA has been changed, no plugin has been enabled in production, and no stable tag or Release has been published.
+The implementation PR is merged. The user selected the existing public repository `songka/cpa-plugin-codex-quota-scheduler` for v0.1.0 publication. No production CPA has been changed or enabled by this work.
 
 ## Compatibility conclusion
 
@@ -40,8 +40,8 @@ The integration runner uses a temporary host checkout or `CPA_HOST_CHECKOUT`, ch
 
 ## Known limits and unfinished external steps
 
-- `songka/cpa-plugin-codex-quota-reserve` is not yet created. GitHub GraphQL and REST both rejected creation with `Resource not accessible by integration` (REST 403). Existing repository read/push access works. Create the new public repository or grant the integration permission, then migrate the reviewed source before publishing store URLs.
-- Stable Release v0.1.0 requires the user's explicit approval after acceptance. No tag has been created. The release job is behind GitHub Environment `release-approval`; configure required reviewers before using it.
+- Publication uses `songka/cpa-plugin-codex-quota-scheduler`; creating a separate repository is no longer required. The registry and plugin metadata point to this existing repository.
+- Tags run validation and both native platform builds before release. Publication was requested by the user; the release job uses GitHub Environment `release-approval`. Configure required reviewers for future releases if an additional GitHub approval gate is desired.
 - Quota percentages are cached upstream estimates. Neither safety margin nor per-request estimate guarantees an exact remaining percentage. Completion does not refund unobserved consumption, and retries consume another estimate. Simultaneous selection can still race at admission and return a local 503 rather than consume a protected account.
 - An empty provider in a strict nested retry is interpreted as Codex. Explicitly name Antigravity or other non-Codex providers in mixed retry chains. Live NewAPI/Antigravity production traffic has not been exercised because production credentials were not supplied.
 - The after-auth guard depends on host credential attribution. Tested host routes provide `selected_auth_id`; a future/new executor path must be integration-tested before relying on it.
@@ -50,4 +50,4 @@ The integration runner uses a temporary host checkout or `CPA_HOST_CHECKOUT`, ch
 - Production hot replacement has not been comprehensively tested. Use restart-based upgrade/rollback and preserve the mounted data. Alpine/musl and other operating systems are outside the requested Linux artifacts.
 - Webhook payload formats were exercised with fixtures; actual external deliveries were not sent. Signed DingTalk endpoints require a signing gateway. Notifications are best-effort, off by default, and have no delivery guarantee.
 - History is saved about once per minute and at graceful shutdown; an abrupt crash can lose the last unsaved samples. Turning history off retains only a current state point for transition deduplication rather than collecting a full curve.
-- Final GitHub Actions execution and release-asset installation/upgrade cannot be claimed before those remote operations occur. Schema validation is not an install of a nonexistent release.
+- GitHub Actions passed implementation validation and native AMD64/ARM64 packaging (run 38515467002). Release publication and public asset installation must be verified separately after the approved tag run.

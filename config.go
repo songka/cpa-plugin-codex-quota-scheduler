@@ -589,7 +589,7 @@ func PluginRegistration() registration {
 			Name:             PluginID,
 			Version:          pluginVersion,
 			Author:           "Jeffery",
-			GitHubRepository: "https://github.com/songka/cpa-plugin-codex-quota-reserve",
+			GitHubRepository: "https://github.com/songka/cpa-plugin-codex-quota-scheduler",
 			Logo:             "https://raw.githubusercontent.com/router-for-me/CLIProxyAPI/main/docs/logo.png",
 		},
 		Capabilities: registrationCapabilities{
