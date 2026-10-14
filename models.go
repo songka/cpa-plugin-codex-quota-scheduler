@@ -154,6 +154,7 @@ type AccountState struct {
 	LastObservedAt     time.Time
 	LastError          string
 	Stale              bool
+	ManagedDisabled    bool
 	TemporaryExhausted bool
 	TemporaryResetAt   time.Time
 	Circuit            CircuitBreakerState

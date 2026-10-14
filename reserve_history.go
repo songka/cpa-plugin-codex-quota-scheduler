@@ -1,12 +1,9 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -20,6 +17,10 @@ type TelemetryPolicy struct {
 	NotificationsEnabled bool    `json:"notifications_enabled"`
 	NotificationKind     string  `json:"notification_kind"`
 	WarningPercent       float64 `json:"reserve_warning_percent"`
+	WebhookURL           string  `json:"webhook_url,omitempty"`
+	TelegramChatID       string  `json:"telegram_chat_id,omitempty"`
+	UsageReportEnabled   bool    `json:"usage_report_enabled"`
+	UsageReportMinutes   int     `json:"usage_report_interval_minutes"`
 }
 type TelemetryInput struct {
 	HistoryEnabled       *bool    `json:"history_enabled,omitempty" yaml:"history_enabled"`
@@ -27,15 +28,45 @@ type TelemetryInput struct {
 	NotificationsEnabled *bool    `json:"notifications_enabled,omitempty" yaml:"notifications_enabled"`
 	NotificationKind     *string  `json:"notification_kind,omitempty" yaml:"notification_kind"`
 	WarningPercent       *float64 `json:"reserve_warning_percent,omitempty" yaml:"reserve_warning_percent"`
+	WebhookURL           *string  `json:"webhook_url,omitempty" yaml:"webhook_url"`
+	TelegramChatID       *string  `json:"telegram_chat_id,omitempty" yaml:"telegram_chat_id"`
+	UsageReportEnabled   *bool    `json:"usage_report_enabled,omitempty" yaml:"usage_report_enabled"`
+	UsageReportMinutes   *int     `json:"usage_report_interval_minutes,omitempty" yaml:"usage_report_interval_minutes"`
 }
 
 func defaultTelemetryPolicy() TelemetryPolicy {
-	return TelemetryPolicy{HistoryEnabled: true, HistoryRetentionDays: 30, NotificationKind: "generic", WarningPercent: 20}
+	return TelemetryPolicy{HistoryEnabled: true, HistoryRetentionDays: 30, NotificationKind: "generic", WarningPercent: 20, UsageReportMinutes: 60}
 }
 func telemetryInputFromPolicy(p TelemetryPolicy) TelemetryInput {
-	return TelemetryInput{&p.HistoryEnabled, &p.HistoryRetentionDays, &p.NotificationsEnabled, &p.NotificationKind, &p.WarningPercent}
+	return TelemetryInput{
+		HistoryEnabled: &p.HistoryEnabled, HistoryRetentionDays: &p.HistoryRetentionDays,
+		NotificationsEnabled: &p.NotificationsEnabled, NotificationKind: &p.NotificationKind, WarningPercent: &p.WarningPercent,
+		WebhookURL: &p.WebhookURL, TelegramChatID: &p.TelegramChatID,
+		UsageReportEnabled: &p.UsageReportEnabled, UsageReportMinutes: &p.UsageReportMinutes,
+	}
 }
 func applyTelemetryInput(p *TelemetryPolicy, in TelemetryInput) error {
+	if in.WebhookURL != nil {
+		if err := validateNotificationEndpoint(*in.WebhookURL); err != nil {
+			return err
+		}
+		p.WebhookURL = *in.WebhookURL
+	}
+	if in.TelegramChatID != nil {
+		if len(*in.TelegramChatID) > 200 {
+			return fmt.Errorf("telegram_chat_id is too long")
+		}
+		p.TelegramChatID = *in.TelegramChatID
+	}
+	if in.UsageReportEnabled != nil {
+		p.UsageReportEnabled = *in.UsageReportEnabled
+	}
+	if in.UsageReportMinutes != nil {
+		if *in.UsageReportMinutes < 1 || *in.UsageReportMinutes > 10080 {
+			return fmt.Errorf("usage_report_interval_minutes must be 1..10080")
+		}
+		p.UsageReportMinutes = *in.UsageReportMinutes
+	}
 	if in.HistoryEnabled != nil {
 		p.HistoryEnabled = *in.HistoryEnabled
 	}
@@ -240,47 +271,6 @@ func (h *quotaHistory) save(path string) error {
 	}
 	return err
 }
-func notificationBody(kind, text string) any {
-	switch kind {
-	case "wecom", "dingtalk":
-		return map[string]any{"msgtype": "text", "text": map[string]string{"content": text}}
-	case "feishu":
-		return map[string]any{"msg_type": "text", "content": map[string]string{"text": text}}
-	case "telegram":
-		return map[string]string{"chat_id": os.Getenv("RESERVE_TELEGRAM_CHAT_ID"), "text": text}
-	default:
-		return map[string]string{"plugin": PluginID, "message": text}
-	}
-}
-func sendReserveNotification(ctx context.Context, kind, text string) error {
-	endpoint := os.Getenv("RESERVE_WEBHOOK_URL")
-	if endpoint == "" {
-		return fmt.Errorf("RESERVE_WEBHOOK_URL is unset")
-	}
-	u, err := url.Parse(endpoint)
-	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil {
-		return fmt.Errorf("notification endpoint must be an HTTPS URL")
-	}
-	raw, err := json.Marshal(notificationBody(kind, text))
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(raw))
-	if err != nil {
-		return fmt.Errorf("notification request invalid")
-	}
-	req.Header.Set("Content-Type", "application/json")
-	client := http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("notification delivery failed")
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("notification HTTP status %d", resp.StatusCode)
-	}
-	return nil
-}
 
 var reserveMonitorMu sync.Mutex
 var reserveMonitorStop chan struct{}
@@ -302,11 +292,21 @@ func startReserveMonitor() {
 	}
 	go func() {
 		defer close(done)
+		deliveryContext, cancelDelivery := context.WithCancel(context.Background())
+		deliveryDone := make(chan struct{})
+		go func() {
+			defer close(deliveryDone)
+			globalState.runNotificationDelivery(deliveryContext)
+		}()
+		defer func() { cancelDelivery(); <-deliveryDone }()
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 		var nextPoll, nextSave time.Time
 		allUnavailable := false
 		failureNotified := map[string]bool{}
+		tracker := newParticipationTracker()
+		report := usageReportClock{}
+		var nextEnforce time.Time
 		for {
 			select {
 			case <-stop:
@@ -316,6 +316,19 @@ func startReserveMonitor() {
 				return
 			case now := <-ticker.C:
 				snap := globalState.Snapshot(now)
+				refresherMu.Lock()
+				r := globalRefresher
+				refresherMu.Unlock()
+				if r != nil {
+					r = r.lifecycleRefresher()
+					if !now.Before(nextEnforce) {
+						if err := r.ApplyReserveQuotaDisables(context.Background()); err != nil {
+							globalState.RecordLog("warn", "reserve.disable_failed", "CPA 账号停用失败，将重试", nil, now)
+						}
+						nextEnforce = now.Add(5 * time.Second)
+					}
+					snap = snapshotWithManagedAccounts(globalState.Snapshot(now), r)
+				}
 				events := globalState.history.collect(snap)
 				if snap.Config.ReserveEnabled && !now.Before(nextPoll) {
 					refresherMu.Lock()
@@ -335,8 +348,7 @@ func startReserveMonitor() {
 					if a.Provider != "codex" {
 						continue
 					}
-					v := accountViewFromState(a, snap.Config, now, nil)
-					if ClassifyAccount(v, now) != Excluded {
+					if participating, _ := accountParticipation(a, snap); participating {
 						usable++
 					}
 					failed := a.LastError != "" && !a.LastSuccessAt.IsZero() && now.Sub(a.LastSuccessAt) > time.Hour
@@ -350,16 +362,16 @@ func startReserveMonitor() {
 					events = append(events, map[string]string{"event": "all_unavailable", "reason": "no_safe_account"})
 				}
 				allUnavailable = unavailable
+				notifications := tracker.collect(snap)
 				for _, e := range events {
 					globalState.RecordLog("info", "reserve."+e["event"], "额度预留状态变化", map[string]any{"auth_id": e["auth_id"], "reason": e["reason"]}, now)
-					if snap.Config.NotificationsEnabled {
-						ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-						err := sendReserveNotification(ctx, snap.Config.NotificationKind, e["event"]+" "+e["auth_id"]+" "+e["reason"])
-						cancel()
-						if err != nil {
-							globalState.RecordLog("warn", "notification.failed", err.Error(), nil, now)
-						}
-					}
+					notifications = append(notifications, notificationForEvent(snap, e["event"], e["auth_id"], e["reason"]))
+				}
+				if report.due(snap.Config.TelemetryPolicy, now) {
+					notifications = append(notifications, notificationForEvent(snap, "usage_report", "", ""))
+				}
+				for _, n := range notifications {
+					globalState.queueQuotaNotification(n)
 				}
 				if !now.Before(nextSave) {
 					if err := globalState.history.save(path); err != nil {

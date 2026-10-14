@@ -224,7 +224,7 @@ func accountViewFromState(a AccountState, cfg Config, now time.Time, trials *Tri
 		}
 	}
 	return AccountView{
-		ReserveCapacity: capacity, ReserveBudget: cfg.ReserveRequestBudgetPercent, ReserveMaxInFlight: cfg.ReserveMaxInFlight, ReserveObservedAt: a.LastSuccessAt,
+		ReserveCapacity: capacity, ReserveBudget: requestBudgetForView(a, cfg), ReserveMaxInFlight: cfg.ReserveMaxInFlight, ReserveObservedAt: a.LastSuccessAt,
 		ReserveBlocked: reserve.Blocked, ReserveReason: reserve.Reason, ReserveValidUntil: reserve.ValidUntil, ReserveFailClosed: cfg.ReserveEnabled && cfg.ReserveFailClosed,
 		ID: a.AuthID, AuthIndex: a.AuthIndex, Instance: a.Instance,
 		PluginPriority: a.Annotation.SchedulerPriority, CPAPriority: a.Priority, Family: a.Family,

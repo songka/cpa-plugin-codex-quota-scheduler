@@ -8,7 +8,8 @@ import (
 )
 
 type PluginState struct {
-	history *quotaHistory
+	history       *quotaHistory
+	notifications chan QuotaNotification
 
 	mu                  sync.RWMutex
 	cfg                 Config
@@ -26,10 +27,11 @@ type PluginState struct {
 
 func NewPluginState(cfg Config) *PluginState {
 	return &PluginState{
-		history:     newQuotaHistory(),
-		cfg:         NormalizeConfig(cfg),
-		accounts:    make(map[string]AccountState),
-		annotations: NormalizeAnnotationState(AnnotationState{}),
+		history:       newQuotaHistory(),
+		notifications: make(chan QuotaNotification, 128),
+		cfg:           NormalizeConfig(cfg),
+		accounts:      make(map[string]AccountState),
+		annotations:   NormalizeAnnotationState(AnnotationState{}),
 	}
 }
 

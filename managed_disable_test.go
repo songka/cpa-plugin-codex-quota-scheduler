@@ -96,6 +96,9 @@ func TestManagedQuotaRecoveryEnablesOnlyOnUsableQuota(t *testing.T) {
 	// The host now carries the disabled credential; simulate its shape.
 	host.authJSON["idx-team"] = host.saved["idx-team.json"]
 	disabledJSON := append(json.RawMessage(nil), host.saved["idx-team.json"]...)
+	if err := r.requestManagedRecovery("team"); err != nil {
+		t.Fatal(err)
+	}
 
 	// Still exhausted: recovery must keep the account disabled.
 	host.httpBody = []byte(`{"rate_limit":{"primary_window":{"used_percent":100,"limit_reached":true,"limit_window_seconds":18000,"reset_after_seconds":18000},"secondary_window":{"used_percent":10,"limit_window_seconds":604800,"reset_after_seconds":86400}}}`)
@@ -150,6 +153,9 @@ func TestManagedQuotaRecoveryRefusesRotatedCredential(t *testing.T) {
 	host.authJSON["idx-team"] = json.RawMessage(`{"access_token":"access-other","refresh_token":"refresh-other","id_token":"` + token + `","disabled":true}`)
 	host.httpBody = []byte(`{"rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_after_seconds":18000},"secondary_window":{"used_percent":5,"limit_window_seconds":604800,"reset_after_seconds":86400}}}`)
 
+	if err := r.requestManagedRecovery("team"); err != nil {
+		t.Fatal(err)
+	}
 	if err := r.RecoverManagedQuotaAccounts(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -198,6 +204,9 @@ func TestManagedQuotaRecoveryKeepsAccountWhenFiveHourStillExhausted(t *testing.T
 		t.Fatal(err)
 	}
 	host.authJSON["idx-team"] = host.saved["idx-team.json"]
+	if err := r.requestManagedRecovery("team"); err != nil {
+		t.Fatal(err)
+	}
 	// The long window recovered but the five-hour window is still exhausted:
 	// the original fork would have re-enabled here; the hardened evidence
 	// requires both windows usable.

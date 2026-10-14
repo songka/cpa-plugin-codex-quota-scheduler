@@ -12,9 +12,10 @@ import (
 	"time"
 )
 
-// ReservePolicy is independent of upstream exhaustion and never edits OAuth files.
+// ReservePolicy excludes unsafe accounts; CPA metadata writes require a separate opt-in.
 type ReservePolicy struct {
 	ReserveEnabled              bool    `json:"reserve_enabled"`
+	ReserveDisableAccounts      bool    `json:"reserve_disable_accounts"`
 	Reserve5HPercent            float64 `json:"reserve_5h_percent"`
 	ReserveLongPercent          float64 `json:"reserve_long_percent"`
 	ReserveStrict               bool    `json:"reserve_strict"`
@@ -22,9 +23,13 @@ type ReservePolicy struct {
 	ReserveSafetyMarginPercent  float64 `json:"reserve_safety_margin_percent"`
 	ReserveMaxInFlight          int     `json:"reserve_max_in_flight"`
 	ReserveRequestBudgetPercent float64 `json:"reserve_request_budget_percent"`
+	ReserveRequestBudgetAuto    bool    `json:"reserve_request_budget_auto"`
+	ReserveRequestBudgetMin     float64 `json:"reserve_request_budget_min_percent"`
+	ReserveRequestBudgetMax     float64 `json:"reserve_request_budget_max_percent"`
 }
 type ReserveInput struct {
 	ReserveEnabled              *bool    `json:"reserve_enabled,omitempty" yaml:"reserve_enabled"`
+	ReserveDisableAccounts      *bool    `json:"reserve_disable_accounts,omitempty" yaml:"reserve_disable_accounts"`
 	Reserve5HPercent            *float64 `json:"reserve_5h_percent,omitempty" yaml:"reserve_5h_percent"`
 	ReserveLongPercent          *float64 `json:"reserve_long_percent,omitempty" yaml:"reserve_long_percent"`
 	ReserveStrict               *bool    `json:"reserve_strict,omitempty" yaml:"reserve_strict"`
@@ -32,6 +37,9 @@ type ReserveInput struct {
 	ReserveSafetyMarginPercent  *float64 `json:"reserve_safety_margin_percent,omitempty" yaml:"reserve_safety_margin_percent"`
 	ReserveMaxInFlight          *int     `json:"reserve_max_in_flight,omitempty" yaml:"reserve_max_in_flight"`
 	ReserveRequestBudgetPercent *float64 `json:"reserve_request_budget_percent,omitempty" yaml:"reserve_request_budget_percent"`
+	ReserveRequestBudgetAuto    *bool    `json:"reserve_request_budget_auto,omitempty" yaml:"reserve_request_budget_auto"`
+	ReserveRequestBudgetMin     *float64 `json:"reserve_request_budget_min_percent,omitempty" yaml:"reserve_request_budget_min_percent"`
+	ReserveRequestBudgetMax     *float64 `json:"reserve_request_budget_max_percent,omitempty" yaml:"reserve_request_budget_max_percent"`
 }
 type ReserveOverride struct {
 	FiveHour   *float64 `json:"five_hour,omitempty" yaml:"five_hour,omitempty"`
@@ -47,19 +55,44 @@ type ReserveStatus struct {
 	LongStopLine        float64   `json:"long_stop_line"`
 	InFlight            int       `json:"in_flight"`
 	EstimatedUnobserved float64   `json:"estimated_unobserved"`
+	RequestBudget       float64   `json:"request_budget_percent"`
+	BudgetSamples       int       `json:"budget_samples"`
 	ValidUntil          time.Time `json:"valid_until,omitempty"`
 }
 
 func DefaultReservePolicy() ReservePolicy {
-	return ReservePolicy{Reserve5HPercent: 10, ReserveLongPercent: 10, ReserveStrict: true, ReserveFailClosed: true, ReserveSafetyMarginPercent: 2, ReserveMaxInFlight: 1, ReserveRequestBudgetPercent: 0.25}
+	return ReservePolicy{Reserve5HPercent: 10, ReserveLongPercent: 10, ReserveStrict: true, ReserveFailClosed: true, ReserveSafetyMarginPercent: 2, ReserveMaxInFlight: 1, ReserveRequestBudgetPercent: 0.25, ReserveRequestBudgetAuto: true, ReserveRequestBudgetMin: 0.01, ReserveRequestBudgetMax: 2}
 }
 func reserveInputFromPolicy(p ReservePolicy) ReserveInput {
-	return ReserveInput{&p.ReserveEnabled, &p.Reserve5HPercent, &p.ReserveLongPercent, &p.ReserveStrict, &p.ReserveFailClosed, &p.ReserveSafetyMarginPercent, &p.ReserveMaxInFlight, &p.ReserveRequestBudgetPercent}
+	return ReserveInput{
+		ReserveEnabled: &p.ReserveEnabled, ReserveDisableAccounts: &p.ReserveDisableAccounts,
+		Reserve5HPercent: &p.Reserve5HPercent, ReserveLongPercent: &p.ReserveLongPercent,
+		ReserveStrict: &p.ReserveStrict, ReserveFailClosed: &p.ReserveFailClosed,
+		ReserveSafetyMarginPercent: &p.ReserveSafetyMarginPercent,
+		ReserveMaxInFlight:         &p.ReserveMaxInFlight, ReserveRequestBudgetPercent: &p.ReserveRequestBudgetPercent,
+		ReserveRequestBudgetAuto: &p.ReserveRequestBudgetAuto, ReserveRequestBudgetMin: &p.ReserveRequestBudgetMin, ReserveRequestBudgetMax: &p.ReserveRequestBudgetMax,
+	}
 }
 func validPercent(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) && v >= 0 && v <= 100 }
 func applyReserveInput(p *ReservePolicy, in ReserveInput) error {
+	if in.ReserveRequestBudgetAuto != nil {
+		p.ReserveRequestBudgetAuto = *in.ReserveRequestBudgetAuto
+	}
+	if in.ReserveRequestBudgetMin != nil {
+		p.ReserveRequestBudgetMin = *in.ReserveRequestBudgetMin
+	}
+	if in.ReserveRequestBudgetMax != nil {
+		p.ReserveRequestBudgetMax = *in.ReserveRequestBudgetMax
+	}
+	if !validPercent(p.ReserveRequestBudgetMin) || !validPercent(p.ReserveRequestBudgetMax) ||
+		p.ReserveRequestBudgetMin <= 0 || p.ReserveRequestBudgetMin > p.ReserveRequestBudgetMax || p.ReserveRequestBudgetMax > 10 {
+		return fmt.Errorf("request budget bounds must satisfy 0 < min <= max <= 10 percent")
+	}
 	if in.ReserveEnabled != nil {
 		p.ReserveEnabled = *in.ReserveEnabled
+	}
+	if in.ReserveDisableAccounts != nil {
+		p.ReserveDisableAccounts = *in.ReserveDisableAccounts
 	}
 	if in.ReserveStrict != nil {
 		p.ReserveStrict = *in.ReserveStrict
@@ -147,7 +180,7 @@ func evaluateReserve(a AccountState, cfg Config, now time.Time) ReserveStatus {
 	if a.Refresh.AuthFailure {
 		return block("auth_failure")
 	}
-	if a.Stale || now.Sub(a.LastSuccessAt) > cfg.QuotaRefreshInterval {
+	if a.Stale || a.LastSuccessAt.After(now) || now.Sub(a.LastSuccessAt) > cfg.QuotaRefreshInterval {
 		if p.ReserveFailClosed {
 			return block("reserve_stale")
 		}
@@ -177,21 +210,23 @@ func reserveRejectDecision() PickDecision {
 }
 
 type reserveLease struct {
-	authID   string
-	observed time.Time
-	charged  float64
+	authID      string
+	observed    time.Time
+	charged     float64
+	fingerprint CredentialFingerprint
 }
 type reserveLedger struct {
-	mu     sync.Mutex
-	leases map[string]reserveLease
-	used   map[string]reserveLease
-	counts map[string]int
+	mu       sync.Mutex
+	leases   map[string]reserveLease
+	used     map[string]reserveLease
+	counts   map[string]int
+	learning map[string]*requestBudgetLearning
 }
 
 var globalReserveLedger = newReserveLedger()
 
 func newReserveLedger() *reserveLedger {
-	return &reserveLedger{leases: make(map[string]reserveLease), used: make(map[string]reserveLease), counts: make(map[string]int)}
+	return &reserveLedger{leases: make(map[string]reserveLease), used: make(map[string]reserveLease), counts: make(map[string]int), learning: make(map[string]*requestBudgetLearning)}
 }
 func (l *reserveLedger) release(id string) { l.mu.Lock(); defer l.mu.Unlock(); l.releaseLocked(id) }
 func (l *reserveLedger) releaseLocked(id string) {
@@ -221,12 +256,18 @@ func (l *reserveLedger) admit(id string, a AccountState, cfg Config, now time.Ti
 		l.releaseLocked(id)
 	}
 	s.InFlight = l.counts[a.AuthID]
+	budget, samples := l.budgetLocked(a, cfg)
+	s.RequestBudget, s.BudgetSamples = budget, samples
 	if sameLease {
 		s.InFlight--
 	}
 	u := l.used[a.AuthID]
-	if !u.observed.Equal(a.LastSuccessAt) {
-		u = reserveLease{authID: a.AuthID, observed: a.LastSuccessAt}
+	if a.LastSuccessAt.Before(u.observed) {
+		s.Blocked, s.Reason = true, "reserve_stale"
+		return s, false
+	}
+	if a.LastSuccessAt.After(u.observed) || a.CredentialFingerprint != u.fingerprint {
+		u = reserveLease{authID: a.AuthID, observed: a.LastSuccessAt, fingerprint: a.CredentialFingerprint}
 	}
 	s.EstimatedUnobserved = u.charged
 	if s.Blocked {
@@ -237,7 +278,6 @@ func (l *reserveLedger) admit(id string, a AccountState, cfg Config, now time.Ti
 		s.Reason = "reserve_concurrency"
 		return s, false
 	}
-	budget := cfg.ReserveRequestBudgetPercent
 	for _, w := range []struct {
 		quota *QuotaWindow
 		line  float64
@@ -250,6 +290,7 @@ func (l *reserveLedger) admit(id string, a AccountState, cfg Config, now time.Ti
 	}
 	u.charged += budget
 	l.used[a.AuthID] = u
+	l.learning[a.AuthID].requests++
 	if !sameLease {
 		l.counts[a.AuthID]++
 	}

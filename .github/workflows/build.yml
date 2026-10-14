@@ -44,7 +44,7 @@ jobs:
           RELEASE_TYPE: ${{ github.ref_type }}
         run: |
           set -euo pipefail
-          VERSION=0.1.0-dev
+          VERSION=0.2.0-dev
           if [[ "$RELEASE_TYPE" == tag ]]; then VERSION="${RELEASE_REF#v}"; fi
           make package VERSION="$VERSION"
           cd dist
@@ -80,4 +80,9 @@ jobs:
           cd dist
           sha256sum -c *.zip.sha256
           cat *.zip.sha256 > checksums.txt
-          gh release create "$RELEASE_TAG" *.zip checksums.txt --repo "$RELEASE_REPO" --verify-tag --title "Codex Quota Reserve $RELEASE_TAG" --generate-notes
+          NOTES="../docs/releases/$RELEASE_TAG.md"
+          if [[ -f "$NOTES" ]]; then
+            gh release create "$RELEASE_TAG" *.zip *.zip.sha256 checksums.txt --repo "$RELEASE_REPO" --verify-tag --title "Codex Quota Reserve $RELEASE_TAG" --notes-file "$NOTES"
+          else
+            gh release create "$RELEASE_TAG" *.zip *.zip.sha256 checksums.txt --repo "$RELEASE_REPO" --verify-tag --title "Codex Quota Reserve $RELEASE_TAG" --generate-notes
+          fi

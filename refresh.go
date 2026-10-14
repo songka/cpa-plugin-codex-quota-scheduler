@@ -220,6 +220,7 @@ type QuotaRefresher struct {
 	roster            HostRosterSnapshot
 	rosterMu          sync.RWMutex
 	rosterAdmissionMu sync.RWMutex
+	managedMu         sync.Mutex
 	lifecycleOwner    *QuotaRefresher
 	lifecycleGate     func(time.Time) ActiveRoster
 
@@ -1361,7 +1362,9 @@ func (r *QuotaRefresher) Start() {
 				// lifecycle owner, which owns the production runtime store.
 				func() {
 					owner := r.lifecycleRefresher()
-					_ = owner.RecoverManagedQuotaAccounts(context.Background())
+					if due := owner.managedRecoveryDeadline(r.now()); !due.IsZero() && !due.After(r.now()) {
+						_ = owner.RecoverManagedQuotaAccounts(context.Background())
+					}
 				}()
 				r.refreshController.OnDeadline(r.now())
 				r.RefreshDueSoon()
@@ -1588,7 +1591,7 @@ func (r *QuotaRefresher) nextRefreshLoopDelay() (time.Duration, bool) {
 	if legacy := r.state.NextRefreshDueAt(now); !legacy.IsZero() && (deadline.IsZero() || legacy.Before(deadline)) {
 		deadline = legacy
 	}
-	if managed := r.managedRecoveryDeadline(now); !managed.IsZero() && (deadline.IsZero() || managed.Before(deadline)) {
+	if managed := r.lifecycleRefresher().managedRecoveryDeadline(now); !managed.IsZero() && (deadline.IsZero() || managed.Before(deadline)) {
 		deadline = managed
 	}
 	if deadline.IsZero() {
@@ -1826,6 +1829,10 @@ func (r *QuotaRefresher) refreshAuthVersionedSource(auth pluginapi.HostAuthFileE
 		Payload: LegacyRefreshPayload{Auth: auth, AdmissionVersion: version},
 	}
 	_ = r.coordinator.Submit(intent).Await(context.Background())
+	// Host metadata writes must happen after the coordinator transaction commits.
+	if err := r.lifecycleRefresher().ApplyReserveQuotaDisables(context.Background()); err != nil {
+		r.state.RecordLog("warn", "reserve.disable_failed", "CPA 账号停用失败，将重试", nil, r.now())
+	}
 }
 
 func (r *QuotaRefresher) refreshAuthVersionedHeld(auth pluginapi.HostAuthFileEntry, version uint64) {
@@ -2216,17 +2223,7 @@ func updateCodexAuthJSON(raw json.RawMessage, credentials CodexCredentials, now 
 }
 
 func (r *QuotaRefresher) refreshResetCredits(credentials CodexCredentials, authID string, version uint64) (ParsedQuota, error) {
-	req := pluginapi.HTTPRequest{
-		Method: http.MethodGet,
-		URL:    resetCreditsEndpoint,
-		Headers: http.Header{
-			"Authorization":      []string{"Bearer " + credentials.AccessToken},
-			"Chatgpt-Account-Id": []string{credentials.ChatGPTAccountID},
-			"Content-Type":       []string{"application/json"},
-			"User-Agent":         []string{quotaUserAgent},
-		},
-	}
-	resp, err := r.doWithAdmissionPermit(authID, version, req)
+	resp, err := r.doWithAdmissionPermit(authID, version, resetCreditsRequest(credentials))
 	if err != nil {
 		return ParsedQuota{}, fmt.Errorf("reset credits request: %w", err)
 	}
@@ -2240,6 +2237,19 @@ func (r *QuotaRefresher) refreshResetCredits(credentials CodexCredentials, authI
 	return quota, nil
 }
 
+func resetCreditsRequest(credentials CodexCredentials) pluginapi.HTTPRequest {
+	return pluginapi.HTTPRequest{
+		Method: http.MethodGet,
+		URL:    resetCreditsEndpoint,
+		Headers: http.Header{
+			"Authorization":      []string{"Bearer " + credentials.AccessToken},
+			"Chatgpt-Account-Id": []string{credentials.ChatGPTAccountID},
+			"Content-Type":       []string{"application/json"},
+			"User-Agent":         []string{quotaUserAgent},
+		},
+	}
+}
+
 func mergeResetCredits(quota *ParsedQuota, resetCredits ParsedQuota) {
 	if resetCredits.ResetCreditsAvailableCount != nil {
 		count := *resetCredits.ResetCreditsAvailableCount
@@ -2249,7 +2259,7 @@ func mergeResetCredits(quota *ParsedQuota, resetCredits ParsedQuota) {
 		count := *resetCredits.ResetCreditsTotalEarnedCount
 		quota.ResetCreditsTotalEarnedCount = &count
 	}
-	if len(resetCredits.ResetCredits) > 0 {
+	if resetCredits.ResetCredits != nil || resetCredits.ResetCreditsAvailableCount != nil {
 		quota.ResetCredits = append([]ResetCredit(nil), resetCredits.ResetCredits...)
 	}
 }

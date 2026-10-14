@@ -203,6 +203,19 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 	}
 	managementRefreshSoon = refreshGlobalRefresherSoon
 	managementRefreshOneSoon = refreshGlobalRefresherOneSoon
+	managementManagedRecoverySoon = func(authID string) error {
+		refresherMu.Lock()
+		r := globalRefresher
+		refresherMu.Unlock()
+		if r == nil {
+			return nil
+		}
+		if err := r.lifecycleRefresher().requestManagedRecovery(authID); err != nil {
+			return err
+		}
+		r.wakeRefreshLoop()
+		return nil
+	}
 	refresherMu.Unlock()
 	// The controller is the sole roster synchronization owner. Host callback
 	// readiness during init is not guaranteed, so startup remains asynchronous.

@@ -247,6 +247,17 @@ func (s *StateStore) PersistentSnapshot() (PersistentState, error) {
 	}
 	return clonePersistentState(s.state), nil
 }
+
+// Timer and telemetry observers must not initiate persistence recovery.
+// Production initialization loads the store before these observers start.
+func (s *StateStore) managedLifecycleSnapshot() map[string]ManagedDisableRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.loaded || len(s.state.ManagedLifecycle) == 0 {
+		return nil
+	}
+	return clonePersistentState(PersistentState{ManagedLifecycle: s.state.ManagedLifecycle}).ManagedLifecycle
+}
 func (s *StateStore) Update(fn func(*PersistentState) error) (PersistentState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

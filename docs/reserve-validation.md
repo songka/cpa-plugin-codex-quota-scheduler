@@ -1,6 +1,6 @@
 # Codex Quota Reserve validation and remaining limits
 
-The implementation PR is merged. The user selected the existing public repository `songka/cpa-plugin-codex-quota-scheduler` for v0.1.0 publication. No production CPA has been changed or enabled by this work.
+The implementation is prepared for v0.2.0 publication in the existing public repository `songka/cpa-plugin-codex-quota-scheduler`. No production CPA has been changed or enabled by this work.
 
 ## Compatibility conclusion
 
@@ -14,7 +14,7 @@ The host skips the calling plugin's request interceptors and lifecycle notificat
 
 - Go 1.26.9 installed with the official archive SHA256 intact; module checksums and `go mod verify` passed.
 - Original baseline: 1,078 passing test results.
-- Final existing and new suites: 1,093 passing test results; no failed or skipped results. Includes subtest results, not a count of top-level functions.
+- Final existing and new suites: 1,093 passing test results; no failed or skipped results. Includes subtest results, not a count of top-level functions. This count is retained as the prior validation record; the release candidate is re-run below after the v0.2.0 budget-test correction.
 - `go vet ./...` and `git diff --check` passed.
 - `go test -race -run '^TestReserve' -count=1 ./...` passed. Covers threshold equality, unknown/stale data, NaN rejection, account overrides, strict selection, recovery, 100-way concurrent admission, unobserved budgets, nested stream lease retention, legacy defaults, persistence, history retention and UI controls.
 - Exact CPA v8.0.27 dynamically loaded the actual `.so`, parsed simulated OAuth quota, selected a safe lower-priority account and rejected protected requests. The actual Manager, configured with Session Affinity and the actual dynamically loaded scheduler, selected the safe account despite an affinity binding to the protected account, then returned `quota_reserve_unavailable` when all accounts were protected.
@@ -50,4 +50,4 @@ The integration runner uses a temporary host checkout or `CPA_HOST_CHECKOUT`, ch
 - Production hot replacement has not been comprehensively tested. Use restart-based upgrade/rollback and preserve the mounted data. Alpine/musl and other operating systems are outside the requested Linux artifacts.
 - Webhook payload formats were exercised with fixtures; actual external deliveries were not sent. Signed DingTalk endpoints require a signing gateway. Notifications are best-effort, off by default, and have no delivery guarantee.
 - History is saved about once per minute and at graceful shutdown; an abrupt crash can lose the last unsaved samples. Turning history off retains only a current state point for transition deduplication rather than collecting a full curve.
-- GitHub Actions passed implementation validation and native AMD64/ARM64 packaging (run 38515467002). Release publication and public asset installation must be verified separately after the approved tag run.
+- GitHub Actions passed the earlier implementation validation and native AMD64/ARM64 packaging (run 38515467002). The v0.2.0 release publication and public asset installation must be verified separately after the approved tag run.

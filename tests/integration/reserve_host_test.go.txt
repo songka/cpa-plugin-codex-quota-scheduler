@@ -61,7 +61,7 @@ func TestReserveDynamicHostIntegration(t *testing.T) {
  host.ApplyConfig(context.Background(),&cfg)
  deadline:=time.Now().Add(15*time.Second)
  for len(host.RegisteredPlugins())!=1 && time.Now().Before(deadline) {time.Sleep(20*time.Millisecond)}
- if plugins:=host.RegisteredPlugins();len(plugins)!=1 || plugins[0].Metadata.Version!="0.1.0" {t.Fatalf("dynamic loading failed: %+v",plugins)}
+ if plugins:=host.RegisteredPlugins();len(plugins)!=1 || plugins[0].Metadata.Version!="0.2.0" {t.Fatalf("dynamic loading failed: %+v",plugins)}
  host.RegisterManagementRoutes(context.Background(),nil)
  call:=func(method,path string,body []byte) *httptest.ResponseRecorder {t.Helper();rr:=httptest.NewRecorder();req:=httptest.NewRequest(method,"http://host/v0/management/plugins/codex-quota-reserve"+path,bytes.NewReader(body));if !host.ServeManagementHTTP(rr,req) {t.Fatalf("management route absent %s",path)};return rr}
  call("POST","/refresh",nil)
@@ -94,7 +94,24 @@ func TestReserveDynamicHostIntegration(t *testing.T) {
  settings:=call("GET","/settings",nil);if !bytes.Contains(settings.Body.Bytes(),[]byte(`"reserve_enabled":true`)) {t.Fatalf("settings missing %s",settings.Body.String())}
  history:=call("GET","/history",nil);if history.Code!=200 || !bytes.Contains(history.Body.Bytes(),[]byte(`"a.json"`)) {t.Fatalf("history missing %s",history.Body.String())}
  exported:=call("GET","/export",nil);if exported.Code!=200 {t.Fatal("export")};if rr:=call("POST","/import",exported.Body.Bytes());rr.Code!=200 {t.Fatalf("import: %s",rr.Body.String())}
+ // Opt in to actual CPA disable writes, then simulate an active reset while
+ // both credentials are outside admission. Manual refresh must reach the
+ // owned recovery lane rather than waiting for their old reset deadlines.
+ var updated map[string]any
+ if err:=json.Unmarshal(settings.Body.Bytes(),&updated);err!=nil {t.Fatal(err)}
+ updated["reserve_disable_accounts"]=true
+ updateJSON,_:=json.Marshal(updated)
+ if rr:=call("PUT","/settings",updateJSON);rr.Code!=200 {t.Fatalf("disable settings: %s",rr.Body.String())}
+ readDisabled:=func(id string) bool {raw,err:=os.ReadFile(filepath.Join(authDir,id+".json"));if err!=nil {t.Fatal(err)};var doc map[string]any;if err:=json.Unmarshal(raw,&doc);err!=nil {t.Fatal(err)};return doc["disabled"]==true}
+ deadline=time.Now().Add(20*time.Second)
+ for time.Now().Before(deadline) && (!readDisabled("a") || !readDisabled("b")) {time.Sleep(100*time.Millisecond)}
+ if !readDisabled("a") || !readDisabled("b") {t.Fatal("protected accounts were marked but not disabled in CPA")}
+ transport.mu.Lock();transport.used["a"]=0;transport.used["b"]=0;transport.mu.Unlock()
+ if rr:=call("POST","/refresh",nil);rr.Code!=202 {t.Fatalf("owned recovery refresh: %s",rr.Body.String())}
+ deadline=time.Now().Add(20*time.Second)
+ for time.Now().Before(deadline) && (readDisabled("a") || readDisabled("b")) {time.Sleep(100*time.Millisecond)}
+ if readDisabled("a") || readDisabled("b") {t.Fatalf("active reset did not recover owned disabled accounts: %s",call("GET","/status?format=json",nil).Body.String())}
  // The host's own Manager terminal-rejection tests exercise the builtin
  // fallback boundary; this test additionally loads and calls the real library.
- t.Log("dynamic ABI, quota parsing, cross-priority selection, pinned guard, concurrency, strict rejection, settings/history/import/export passed")
+ t.Log("dynamic ABI, quota parsing, cross-priority selection, pinned guard, concurrency, strict rejection, settings/history/import/export, CPA disable and active-reset recovery passed")
 }

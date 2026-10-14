@@ -20,6 +20,7 @@ const managementBasePath = "/plugins/" + PluginID
 
 var managementRefreshSoon = func() {}
 var managementRefreshOneSoon = func(authID string) {}
+var managementManagedRecoverySoon = func(authID string) error { return nil }
 var managementProvisionalRiskChanged = func(bool) {}
 
 type StatusPayload struct {
@@ -86,6 +87,8 @@ type EmptyStatePayload struct {
 type SettingsPayload struct {
 	TelemetryInput
 	ReserveInput
+	WebhookConfigured  bool `json:"webhook_configured"`
+	TelegramConfigured bool `json:"telegram_chat_id_configured"`
 
 	HandleEnabled                   bool        `json:"handle_enabled"`
 	MonthlyMode                     MonthlyMode `json:"monthly_mode"`
@@ -236,6 +239,7 @@ func RegisterManagement() pluginapi.ManagementRegistrationResponse {
 			{Method: http.MethodGet, Path: managementBasePath + "/export", Description: "Export scheduler configuration."},
 			{Method: http.MethodPost, Path: managementBasePath + "/import", Description: "Import scheduler configuration."},
 			{Method: http.MethodGet, Path: managementBasePath + "/history", Description: "Read quota history."},
+			{Method: http.MethodPost, Path: managementBasePath + "/notifications/test", Description: "Send a test quota notification."},
 			{Method: http.MethodGet, Path: managementBasePath + "/annotations", Description: "Read quota annotations."},
 			{Method: http.MethodPut, Path: managementBasePath + "/annotations", Description: "Replace quota annotations."},
 			{Method: http.MethodPatch, Path: managementBasePath + "/annotations/account", Description: "Update one account annotation."},
@@ -275,11 +279,16 @@ func handleManagementRequest(store *PluginState, req pluginapi.ManagementRequest
 	case method == http.MethodPut && path == "/settings":
 		return handlePutSettings(store, req, now)
 	case method == http.MethodPost && path == "/refresh":
+		if err := managementManagedRecoverySoon(""); err != nil {
+			return jsonManagementResponse(http.StatusInternalServerError, map[string]string{"error": "无法安排托管恢复探测"})
+		}
 		triggerRefreshSoon()
 		store.RecordLog("info", "ui.refresh_requested", "页面请求刷新额度", nil, now)
 		return jsonManagementResponse(http.StatusAccepted, map[string]bool{"ok": true})
 	case method == http.MethodPost && path == "/refresh/account":
-		return handleRefreshAccountRequest(store, req, now)
+		return handleRefreshAccountRequest(store, req, now, lifecycle)
+	case method == http.MethodPost && path == "/notifications/test":
+		return handleTestNotification(store, req, now, lifecycle)
 	case method == http.MethodGet && path == "/history":
 		store.history.collect(store.Snapshot(now))
 		return jsonManagementResponse(http.StatusOK, store.history.snapshot())
@@ -348,9 +357,13 @@ func resourceRouteAllowed(method, path string) bool {
 }
 
 func SettingsFromConfig(cfg Config) SettingsPayload {
+	telemetry := telemetryInputFromPolicy(cfg.TelemetryPolicy)
+	telemetry.WebhookURL, telemetry.TelegramChatID = nil, nil
 	return SettingsPayload{
 		ReserveInput:                    reserveInputFromPolicy(cfg.ReservePolicy),
-		TelemetryInput:                  telemetryInputFromPolicy(cfg.TelemetryPolicy),
+		TelemetryInput:                  telemetry,
+		WebhookConfigured:               notificationEndpoint(cfg.TelemetryPolicy) != "",
+		TelegramConfigured:              notificationChatID(cfg.TelemetryPolicy) != "",
 		HandleEnabled:                   cfg.HandleEnabled,
 		MonthlyMode:                     cfg.MonthlyMode,
 		QuotaRefreshInterval:            cfg.QuotaRefreshInterval.String(),
@@ -635,7 +648,7 @@ type refreshAccountPayload struct {
 	AuthID string `json:"auth_id"`
 }
 
-func handleRefreshAccountRequest(store *PluginState, req pluginapi.ManagementRequest, now time.Time) pluginapi.ManagementResponse {
+func handleRefreshAccountRequest(store *PluginState, req pluginapi.ManagementRequest, now time.Time, lifecycle *ManagementLifecycleSnapshot) pluginapi.ManagementResponse {
 	authID := strings.TrimSpace(req.Query.Get("auth_id"))
 	if authID == "" && len(req.Body) > 0 {
 		var payload refreshAccountPayload
@@ -646,6 +659,17 @@ func handleRefreshAccountRequest(store *PluginState, req pluginapi.ManagementReq
 	}
 	if authID == "" {
 		return jsonManagementResponse(http.StatusBadRequest, map[string]string{"error": "auth_id is required"})
+	}
+	if lifecycle != nil {
+		for _, record := range lifecycle.ManagedLifecycle {
+			if record.DisableApplied && record.AuthID == authID {
+				if err := managementManagedRecoverySoon(authID); err != nil {
+					return jsonManagementResponse(http.StatusInternalServerError, map[string]string{"error": "无法安排托管恢复探测"})
+				}
+				store.RecordLog("info", "ui.managed_recovery_requested", "页面请求检查主动重置后的额度恢复", map[string]any{"auth_id": authID}, now)
+				return jsonManagementResponse(http.StatusAccepted, map[string]bool{"ok": true})
+			}
+		}
 	}
 	if !store.IsAuthAdmitted(authID) {
 		return jsonManagementResponse(http.StatusConflict, map[string]string{
@@ -659,6 +683,7 @@ func handleRefreshAccountRequest(store *PluginState, req pluginapi.ManagementReq
 
 func handleExportState(store *PluginState, now time.Time) pluginapi.ManagementResponse {
 	state := diskStateFromStore(store)
+	state.Config.WebhookURL, state.Config.TelegramChatID = "", ""
 	store.RecordLog("info", "ui.config_exported", "页面导出插件配置", nil, now)
 	return jsonManagementResponse(http.StatusOK, normalizePluginDiskState(state))
 }
@@ -670,6 +695,21 @@ func handleImportState(store *PluginState, body []byte, now time.Time) pluginapi
 	}
 	var state PluginDiskState
 	if err := json.Unmarshal([]byte(raw), &state); err != nil {
+		return jsonManagementResponse(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	}
+	var envelope struct {
+		Config TelemetryInput `json:"config"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return jsonManagementResponse(http.StatusBadRequest, map[string]string{"error": "invalid telemetry configuration"})
+	}
+	// Redacted exports omit secrets; importing one must not erase saved credentials.
+	state.Config.WebhookURL = store.Config().WebhookURL
+	state.Config.TelegramChatID = store.Config().TelegramChatID
+	if err := applyTelemetryInput(&state.Config.TelemetryPolicy, envelope.Config); err != nil {
+		return jsonManagementResponse(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	}
+	if err := applyReserveInput(&state.Config.ReservePolicy, reserveInputFromPolicy(state.Config.ReservePolicy)); err != nil {
 		return jsonManagementResponse(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
 	if _, err := validateQuotaEndpoint(state.Config.QuotaEndpoint); err != nil {
@@ -689,6 +729,32 @@ func handleImportState(store *PluginState, body []byte, now time.Time) pluginapi
 	store.SetAnnotations(AnnotationState{Accounts: state.Accounts, Groups: state.Groups})
 	publishSchedulerState(store, nil, now)
 	store.RecordLog("info", "ui.config_imported", "页面导入插件配置", nil, now)
+	return jsonManagementResponse(http.StatusOK, map[string]bool{"ok": true})
+}
+
+func handleTestNotification(store *PluginState, req pluginapi.ManagementRequest, now time.Time, lifecycle *ManagementLifecycleSnapshot) pluginapi.ManagementResponse {
+	policy := store.Config().TelemetryPolicy
+	var input TelemetryInput
+	if len(req.Body) > 0 {
+		if err := json.Unmarshal(req.Body, &input); err != nil {
+			return jsonManagementResponse(http.StatusBadRequest, map[string]string{"error": "invalid notification settings"})
+		}
+	}
+	if err := applyTelemetryInput(&policy, input); err != nil {
+		return jsonManagementResponse(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	}
+	if notificationEndpoint(policy) == "" || (policy.NotificationKind == "telegram" && notificationChatID(policy) == "") {
+		return jsonManagementResponse(http.StatusBadRequest, map[string]string{"error": "通知地址或 Telegram Chat ID 未配置"})
+	}
+	snapshot := store.Snapshot(now)
+	if lifecycle != nil {
+		snapshot = mergeManagedAccounts(snapshot, lifecycle.ManagedLifecycle)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := sendQuotaNotification(ctx, policy, notificationForEvent(snapshot, "test", "", "")); err != nil {
+		return jsonManagementResponse(http.StatusBadGateway, map[string]string{"error": err.Error()})
+	}
 	return jsonManagementResponse(http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -750,9 +816,11 @@ func buildStatusPayload(snapshot StateSnapshot, ordered []ScheduledAccount, life
 			groupNotes = group.Notes
 		}
 
+		reserveStatus := evaluateReserve(account, snapshot.Config, snapshot.Now)
+		reserveStatus.RequestBudget, reserveStatus.BudgetSamples = globalReserveLedger.requestBudget(account, snapshot.Config)
 		status := StatusAccount{
 			PlanType:          account.Quota.PlanType,
-			Reserve:           evaluateReserve(account, snapshot.Config, snapshot.Now),
+			Reserve:           reserveStatus,
 			ReserveOverride:   account.Annotation.ReserveOverride,
 			Rank:              i + 1,
 			AuthID:            scheduled.AuthID,
@@ -1204,6 +1272,25 @@ func buildCurrentStatusPayloadWithLifecycle(store *PluginState, now time.Time, l
 		filtered.Accounts = append(filtered.Accounts, account)
 	}
 	ordered := buildOrderedAccounts(syntheticRosterStatusRequest(filtered, lifecycle.Roster), filtered, now, globalTrials)
+	filtered = mergeManagedAccounts(filtered, lifecycle.ManagedLifecycle)
+	seen := map[string]bool{}
+	for i := range ordered {
+		seen[ordered[i].AuthID] = true
+		for _, account := range filtered.Accounts {
+			if account.AuthID == ordered[i].AuthID && account.ManagedDisabled {
+				ordered[i].Available = false
+				ordered[i].UnavailableReason = "managed_disabled"
+			}
+		}
+	}
+	for _, account := range filtered.Accounts {
+		if account.ManagedDisabled && !seen[account.AuthID] {
+			ordered = append(ordered, ScheduledAccount{
+				AuthID: account.AuthID, Family: account.Family, Annotation: account.Annotation,
+				UnavailableReason: "managed_disabled",
+			})
+		}
+	}
 	return buildStatusPayload(filtered, ordered, &lifecycle)
 }
 
@@ -1507,7 +1594,37 @@ var statusTemplateV2 = template.Must(template.New("status-v2").Funcs(template.Fu
 <div class="notice staticHint" data-i18n="connection.backgroundHint">只要调度器启动了，它就会在后台自动运行，无需保持页面开启。</div>
 <div class="warning" id="resetProbeWarning" hidden><strong data-i18n="resetProbe.warningTitle">自动激活新的额度周期默认关闭</strong><span data-i18n="resetProbe.warningBody">开启后，调度器会在额度重置时间已到但新周期尚未生成时，发送一次极小的 Codex 请求尝试激活新周期。</span></div>
 <details class="section collapsible" id="settingsPanel" hidden><summary><span class="summary-toggle" aria-hidden="true">&gt;</span><span class="summary-text"><span class="summary-title" data-i18n="settings.title">调度设置</span><span class="summary-subtitle" data-i18n="settings.summary">默认配置已经都设置好了，正常情况下不需要手动设置。</span></span></summary><div class="collapsible-body">
-<fieldset><legend>历史与通知</legend><label class="toggle"><span>保存额度历史</span><input id="reserveHistory" type="checkbox"></label><label class="field"><span>历史保留天数</span><input id="reserveHistoryDays" type="number" min="1" max="365"></label><label class="toggle"><span>启用 Webhook 通知</span><input id="reserveNotify" type="checkbox"></label><label class="field"><span>通知格式</span><select id="reserveNotifyKind"><option value="generic">通用 HTTP</option><option value="wecom">企业微信</option><option value="feishu">飞书</option><option value="dingtalk">钉钉</option><option value="telegram">Telegram</option></select></label><label class="field"><span>低额度预警线 (%)</span><input id="reserveWarning" type="number" min="0" max="100"></label><p>通知地址通过 RESERVE_WEBHOOK_URL 注入；Telegram 另需 RESERVE_TELEGRAM_CHAT_ID。默认关闭通知。</p></fieldset><fieldset><legend>额度预留保护</legend><p>调度停止线 = 最低保留比例 + 安全余量。此策略不能保证精确保留上游额度。</p><label class="field"><span>启用额度预留保护</span><input id="reserveEnabled" type="checkbox"></label><label class="field"><span>5h 最低保留比例 (%)</span><input id="reserve5H" type="number" min="0" max="100" step="0.1"></label><label class="field"><span>Weekly/Monthly 最低保留比例 (%)</span><input id="reserveLong" type="number" min="0" max="100" step="0.1"></label><label class="field"><span>严格保护（无安全账户则拒绝）</span><input id="reserveStrict" type="checkbox"></label><label class="field"><span>额度未知或过期时停止分配</span><input id="reserveFailClosed" type="checkbox"></label><label class="field"><span>额外安全余量 (%)</span><input id="reserveMargin" type="number" min="0" max="100" step="0.1"></label><label class="field"><span>每账户最多在途请求</span><input id="reserveInFlight" type="number" min="1" max="1000"></label><label class="field"><span>每请求估算消耗 (%)</span><input id="reserveBudget" type="number" min="0" max="100" step="0.1"></label></fieldset>
+<fieldset><legend>历史与通知</legend>
+<label class="toggle"><span>保存额度历史</span><input id="reserveHistory" type="checkbox"></label>
+<label class="field"><span>历史保留天数</span><input id="reserveHistoryDays" type="number" min="1" max="365"></label>
+<label class="toggle"><span>启用 Webhook 通知</span><input id="reserveNotify" type="checkbox"></label>
+<label class="field"><span>通知格式</span><select id="reserveNotifyKind"><option value="generic">通用 HTTP</option><option value="wecom">企业微信</option><option value="feishu">飞书</option><option value="dingtalk">钉钉</option><option value="telegram">Telegram</option></select></label>
+<label class="field"><span data-i18n="reserve.webhook">Webhook 地址</span><input id="reserveWebhook" type="password" autocomplete="new-password" spellcheck="false" aria-describedby="reserveWebhookState"></label>
+<span id="reserveWebhookState" class="setting-help"></span>
+<label class="toggle"><span data-i18n="reserve.clearWebhook">清除已保存的 Webhook 地址</span><input id="reserveClearWebhook" type="checkbox"></label>
+<label class="field"><span>Telegram Chat ID</span><input id="reserveChatID" type="password" autocomplete="new-password" spellcheck="false" aria-describedby="reserveChatState"></label>
+<span id="reserveChatState" class="setting-help"></span>
+<label class="toggle"><span data-i18n="reserve.clearChat">清除已保存的 Chat ID</span><input id="reserveClearChat" type="checkbox"></label>
+<label class="toggle"><span data-i18n="reserve.report">定时发送使用报告</span><input id="reserveReport" type="checkbox"></label>
+<label class="field"><span data-i18n="reserve.reportMinutes">报告间隔（分钟）</span><input id="reserveReportMinutes" type="number" min="1" max="10080" step="1"></label>
+<label class="field"><span>低额度预警线 (%)</span><input id="reserveWarning" type="number" min="0" max="100"></label>
+<button id="reserveTestNotify" type="button" class="secondary" data-i18n="reserve.test">发送测试通知</button>
+<output id="reserveTestResult" role="status" aria-live="polite"></output>
+</fieldset>
+<fieldset><legend>额度预留保护</legend>
+<label class="toggle"><span>启用额度预留保护</span><input id="reserveEnabled" type="checkbox"></label>
+<label class="toggle"><span data-i18n="reserve.disable">达到预留线时在 CPA 中停用账号</span><input id="reserveDisable" type="checkbox"></label>
+<label class="field"><span>5h 最低保留比例 (%)</span><input id="reserve5H" type="number" min="0" max="100" step="0.1"></label>
+<label class="field"><span>Weekly/Monthly 最低保留比例 (%)</span><input id="reserveLong" type="number" min="0" max="100" step="0.1"></label>
+<label class="toggle"><span>严格保护（无安全账户则拒绝）</span><input id="reserveStrict" type="checkbox"></label>
+<label class="toggle"><span>额度未知或过期时停止分配</span><input id="reserveFailClosed" type="checkbox"></label>
+<label class="field"><span>额外安全余量 (%)</span><input id="reserveMargin" type="number" min="0" max="100" step="0.1"></label>
+<label class="field"><span>每账户最多在途请求</span><input id="reserveInFlight" type="number" min="1" max="1000"></label>
+<label class="toggle"><span data-i18n="reserve.autoBudget">自动估算每请求消耗</span><input id="reserveBudgetAuto" type="checkbox"></label>
+<label class="field"><span data-i18n="reserve.budget">每请求回退 / 固定消耗 (%)</span><input id="reserveBudget" type="number" min="0" max="100" step="0.01"></label>
+<label class="field"><span data-i18n="reserve.budgetMin">自动估算下限 (%)</span><input id="reserveBudgetMin" type="number" min="0.001" max="10" step="0.001"></label>
+<label class="field"><span data-i18n="reserve.budgetMax">自动估算上限 (%)</span><input id="reserveBudgetMax" type="number" min="0.001" max="10" step="0.001"></label>
+</fieldset>
 <label class="toggle"><span data-i18n="settings.handleEnabled">启用调度接管</span><input id="handleEnabled" type="checkbox"></label>
 <label class="toggle"><span data-i18n="settings.usageFeedback">失败反馈标记额度耗尽</span><input id="usageFeedback" type="checkbox"></label>
 <div class="setting-with-help"><label class="toggle"><span data-i18n="settings.enableResetProbe">自动激活新的额度周期</span><input id="enableResetProbe" name="enable_reset_probe" type="checkbox"></label><p class="setting-help" data-i18n="settings.enableResetProbeHelp">即使普通刷新处于休眠状态，Probe 也会按额度刷新间隔执行只读检查，最短 30 分钟；只有检测到延迟启动的重置窗口时，才发送一次极小请求。可能消耗少量额度。</p></div>
@@ -1604,6 +1721,20 @@ const TRANSLATIONS={
     'notice.settingsSaved':'设置已保存，页面内容会自动更新。','notice.statusLoaded':'已加载当前设置。请确认后再次保存。','notice.refreshRequested':'已请求后台刷新额度，页面内容会自动更新。','notice.accountSaved':'账号卡片已保存，页面内容会自动更新。','notice.accountPinned':'账号已固定，插件优先级已设为 999。','notice.accountUnpinned':'已取消固定，插件优先级已重置为 0。','notice.refreshOneRequested':'已请求刷新该账号额度，页面内容会自动更新。','notice.configExported':'配置已导出。','notice.logsExported':'日志已导出。','notice.configImported':'配置已导入，页面内容会自动更新。','error.requestFailed':'请求失败：{status}','error.managementKeyRequired':'需要填写 CPA 管理密钥','error.schedulerPriorityInteger':'插件优先级必须是安全整数。'
   }
 };
+Object.assign(TRANSLATIONS.en,{
+  'reserve.webhook':'Webhook URL','reserve.clearWebhook':'Clear saved Webhook URL','reserve.clearChat':'Clear saved Chat ID',
+  'reserve.report':'Scheduled usage report','reserve.reportMinutes':'Report interval (minutes)','reserve.test':'Send test notification',
+  'reserve.disable':'Disable in CPA at the reserve threshold','reserve.autoBudget':'Estimate per-request consumption automatically',
+  'reserve.budget':'Fallback / fixed consumption per request (%)','reserve.budgetMin':'Automatic estimate minimum (%)','reserve.budgetMax':'Automatic estimate maximum (%)',
+  'reserve.configured':'Configured; leave blank to keep','reserve.unconfigured':'Not configured','reserve.sending':'Sending notification...','reserve.sent':'Test notification sent'
+});
+Object.assign(TRANSLATIONS['zh-CN'],{
+  'reserve.webhook':'Webhook 地址','reserve.clearWebhook':'清除已保存的 Webhook 地址','reserve.clearChat':'清除已保存的 Chat ID',
+  'reserve.report':'定时发送使用报告','reserve.reportMinutes':'报告间隔（分钟）','reserve.test':'发送测试通知',
+  'reserve.disable':'达到预留线时在 CPA 中停用账号','reserve.autoBudget':'自动估算每请求消耗',
+  'reserve.budget':'每请求回退 / 固定消耗 (%)','reserve.budgetMin':'自动估算下限 (%)','reserve.budgetMax':'自动估算上限 (%)',
+  'reserve.configured':'已配置；留空保留','reserve.unconfigured':'尚未配置','reserve.sending':'正在发送通知...','reserve.sent':'测试通知已发送'
+});
 TRANSLATIONS.en['retry.always']='Always retry all models';
 TRANSLATIONS.en['retry.alwaysHelp']='Retry every model, including models without a configured chain. When no fallback is configured, retry the same model. Mutually exclusive with Shadow mode.';
 TRANSLATIONS.en['retry.modes']='Shadow mode and Always retry cannot both be enabled.';
@@ -1769,7 +1900,36 @@ async function refreshStatus(options){const opts=options||{};const data=await re
 function startStatusPolling(){if(statusPollID)return;statusPollID=window.setInterval(()=>refreshStatus({management:true}).catch(()=>{}),15000)}
 async function loadStatus(){try{await refreshStatus({management:true,fillSettings:true});const remember=document.getElementById('rememberManagementKey');if(remember&&remember.checked&&hasManagementKey()){restoredManagementKey=true;syncManagementKeyVisibility()}showNotice(t('notice.statusLoaded'),false,'notice.statusLoaded');startStatusPolling()}catch(error){showNotice(error.message||String(error),true)}}
 async function pollStatus(times,delayMs){for(let i=0;i<times;i++){await new Promise((resolve)=>window.setTimeout(resolve,delayMs));await refreshStatus()}}
-function collectSettingsPayload(){return{history_enabled:document.getElementById('reserveHistory').checked,history_retention_days:document.getElementById('reserveHistoryDays').valueAsNumber,notifications_enabled:document.getElementById('reserveNotify').checked,notification_kind:document.getElementById('reserveNotifyKind').value,reserve_warning_percent:document.getElementById('reserveWarning').valueAsNumber,reserve_enabled:document.getElementById('reserveEnabled').checked,reserve_5h_percent:document.getElementById('reserve5H').valueAsNumber,reserve_long_percent:document.getElementById('reserveLong').valueAsNumber,reserve_strict:document.getElementById('reserveStrict').checked,reserve_fail_closed:document.getElementById('reserveFailClosed').checked,reserve_safety_margin_percent:document.getElementById('reserveMargin').valueAsNumber,reserve_max_in_flight:document.getElementById('reserveInFlight').valueAsNumber,reserve_request_budget_percent:document.getElementById('reserveBudget').valueAsNumber,handle_enabled:document.getElementById('handleEnabled').checked,enable_usage_feedback:document.getElementById('usageFeedback').checked,enable_reset_probe:document.getElementById('enableResetProbe').checked,probe_on_provisional_roster:document.getElementById('probeOnProvisionalRoster').checked,monthly_mode:document.getElementById('monthlyMode').value,schedule_across_priorities:document.getElementById('scheduleAcrossPriorities').checked,enable_managed_quota_disable:document.getElementById('enableManagedQuotaDisable').checked,lifecycle_event_limit:Number.parseInt(document.getElementById('lifecycleEventLimit').value,10)||50,quota_refresh_interval:document.getElementById('refreshInterval').value.trim(),stale_after:document.getElementById('staleAfter').value.trim(),refresh_active_window:document.getElementById('refreshActiveWindow').value.trim(),refresh_after_reset_delay:document.getElementById('refreshAfterResetDelay').value.trim(),refresh_retry_delays:document.getElementById('refreshRetryDelays').value.trim(),auth_failure_retry_interval:document.getElementById('authFailureRetryInterval').value.trim(),refresh_on_startup:document.getElementById('refreshOnStartup').checked,max_refresh_concurrency:Number.parseInt(document.getElementById('maxConcurrency').value,10)||1,circuit_failure_threshold:Number.parseInt(document.getElementById('circuitFailureThreshold').value,10)||5,circuit_open_duration:document.getElementById('circuitOpenDuration').value.trim(),circuit_half_open_success_threshold:Number.parseInt(document.getElementById('circuitHalfOpenSuccessThreshold').value,10)||2,max_log_entries:Number.parseInt(document.getElementById('maxLogEntries').value,10)||200,log_retention:document.getElementById('logRetention').value.trim(),retry_enabled:retryElement('retryEnabled').checked===true,retry_shadow:retryElement('retryShadow').checked===true,retry_always:retryElement('retryAlways').checked===true,retry_strip_reasoning:retryElement('retryStripReasoning').checked!==false,retry_max_attempts:retryIntValue('retryMaxAttempts',4),retry_max_frames:retryIntValue('retryMaxFrames',4096),retry_stall_timeout:retryDurationValue('retryStallTimeout','60s'),retry_hold_timeout:retryDurationValue('retryHoldTimeout','90s'),retry_chain_deadline:retryDurationValue('retryChainDeadline','240s'),retry_max_bytes:retryTextValue('retryMaxBytes','8MB'),retry_chain:collectRetryChainRows()}}
+function collectNotificationPayload(){
+  const payload={notifications_enabled:document.getElementById('reserveNotify').checked,notification_kind:document.getElementById('reserveNotifyKind').value,
+    usage_report_enabled:document.getElementById('reserveReport').checked,usage_report_interval_minutes:document.getElementById('reserveReportMinutes').valueAsNumber};
+  for(const [key,input,clear] of [['webhook_url','reserveWebhook','reserveClearWebhook'],['telegram_chat_id','reserveChatID','reserveClearChat']]){
+    const value=document.getElementById(input).value.trim();
+    if(document.getElementById(clear).checked)payload[key]='';
+    else if(value)payload[key]=value;
+  }
+  return payload;
+}
+function collectSettingsPayload(){return{
+  ...collectNotificationPayload(),
+  history_enabled:document.getElementById('reserveHistory').checked,history_retention_days:document.getElementById('reserveHistoryDays').valueAsNumber,reserve_warning_percent:document.getElementById('reserveWarning').valueAsNumber,
+  reserve_enabled:document.getElementById('reserveEnabled').checked,reserve_disable_accounts:document.getElementById('reserveDisable').checked,
+  reserve_5h_percent:document.getElementById('reserve5H').valueAsNumber,reserve_long_percent:document.getElementById('reserveLong').valueAsNumber,
+  reserve_strict:document.getElementById('reserveStrict').checked,reserve_fail_closed:document.getElementById('reserveFailClosed').checked,
+  reserve_safety_margin_percent:document.getElementById('reserveMargin').valueAsNumber,reserve_max_in_flight:document.getElementById('reserveInFlight').valueAsNumber,
+  reserve_request_budget_percent:document.getElementById('reserveBudget').valueAsNumber,reserve_request_budget_auto:document.getElementById('reserveBudgetAuto').checked,
+  reserve_request_budget_min_percent:document.getElementById('reserveBudgetMin').valueAsNumber,reserve_request_budget_max_percent:document.getElementById('reserveBudgetMax').valueAsNumber,
+  handle_enabled:document.getElementById('handleEnabled').checked,enable_usage_feedback:document.getElementById('usageFeedback').checked,enable_reset_probe:document.getElementById('enableResetProbe').checked,probe_on_provisional_roster:document.getElementById('probeOnProvisionalRoster').checked,monthly_mode:document.getElementById('monthlyMode').value,schedule_across_priorities:document.getElementById('scheduleAcrossPriorities').checked,enable_managed_quota_disable:document.getElementById('enableManagedQuotaDisable').checked,lifecycle_event_limit:Number.parseInt(document.getElementById('lifecycleEventLimit').value,10)||50,
+  quota_refresh_interval:document.getElementById('refreshInterval').value.trim(),stale_after:document.getElementById('staleAfter').value.trim(),refresh_active_window:document.getElementById('refreshActiveWindow').value.trim(),refresh_after_reset_delay:document.getElementById('refreshAfterResetDelay').value.trim(),refresh_retry_delays:document.getElementById('refreshRetryDelays').value.trim(),auth_failure_retry_interval:document.getElementById('authFailureRetryInterval').value.trim(),refresh_on_startup:document.getElementById('refreshOnStartup').checked,max_refresh_concurrency:Number.parseInt(document.getElementById('maxConcurrency').value,10)||1,circuit_failure_threshold:Number.parseInt(document.getElementById('circuitFailureThreshold').value,10)||5,circuit_open_duration:document.getElementById('circuitOpenDuration').value.trim(),circuit_half_open_success_threshold:Number.parseInt(document.getElementById('circuitHalfOpenSuccessThreshold').value,10)||2,max_log_entries:Number.parseInt(document.getElementById('maxLogEntries').value,10)||200,log_retention:document.getElementById('logRetention').value.trim(),
+  retry_enabled:retryElement('retryEnabled').checked===true,retry_shadow:retryElement('retryShadow').checked===true,retry_always:retryElement('retryAlways').checked===true,retry_strip_reasoning:retryElement('retryStripReasoning').checked!==false,retry_max_attempts:retryIntValue('retryMaxAttempts',4),retry_max_frames:retryIntValue('retryMaxFrames',4096),retry_stall_timeout:retryDurationValue('retryStallTimeout','60s'),retry_hold_timeout:retryDurationValue('retryHoldTimeout','90s'),retry_chain_deadline:retryDurationValue('retryChainDeadline','240s'),retry_max_bytes:retryTextValue('retryMaxBytes','8MB'),retry_chain:collectRetryChainRows()
+}}
+async function testReserveNotification(){
+  const button=document.getElementById('reserveTestNotify'),result=document.getElementById('reserveTestResult');
+  button.disabled=true;result.textContent=t('reserve.sending');
+  try{await requestManagement('/notifications/test',{method:'POST',body:collectNotificationPayload()});result.textContent=t('reserve.sent')}
+  catch(error){result.textContent=error.message||String(error)}
+  finally{button.disabled=false}
+}
 function node(tag,className,text){const item=document.createElement(tag);if(className)item.className=className;if(text!==undefined)item.textContent=text;return item}
 function addKV(parent,key,value){parent.append(node('span','',key),node('span','',value||'暂无'))}
 function quotaSourceLabel(source){if(source==='observed')return currentLocale==='en'?'Response observation':'响应观测';if(source==='polled')return currentLocale==='en'?'Polled refresh':'轮询刷新';return ''}
@@ -1788,7 +1948,20 @@ function renderAccounts(accounts){const queue=document.querySelector('section.qu
 async function readJSON(resp){const text=await resp.text();if(!text)return{};try{return JSON.parse(text)}catch{return{error:text}}}
 function authHeaders(){const input=document.getElementById('managementKey');const key=(input&&input.value||'').trim();if(!key)throw new Error(t('error.managementKeyRequired'));const name='Author'+'ization';const scheme='Bea'+'rer ';const headers={};headers[name]=key.toLowerCase().startsWith(scheme.toLowerCase())?key:scheme+key;return headers}
 async function requestManagement(path,options){const opts=options||{};const headers=authHeaders();let url=MANAGEMENT_BASE+path;if(opts.query){const params=new URLSearchParams(opts.query);url+='?'+params.toString()}const init={method:opts.method||'GET',headers};if(Object.prototype.hasOwnProperty.call(opts,'body')){headers['Content-Type']=opts.contentType||'application/json';init.body=typeof opts.body==='string'?opts.body:JSON.stringify(opts.body)}const resp=await fetch(url,init);const data=await readJSON(resp);const message=data.error||data.message||t('error.requestFailed',{status:resp.status});if(!resp.ok){if(resp.status===401||/invalid management key/i.test(message))showManagementKeyInput();throw new Error(message)}return data}
-function fillSettings(){const s=STATUS.settings||{};document.getElementById('reserveHistory').checked=s.history_enabled!==false;document.getElementById('reserveHistoryDays').value=s.history_retention_days??30;document.getElementById('reserveNotify').checked=s.notifications_enabled===true;document.getElementById('reserveNotifyKind').value=s.notification_kind??'generic';document.getElementById('reserveWarning').value=s.reserve_warning_percent??20;document.getElementById('reserveEnabled').checked=s.reserve_enabled??false;document.getElementById('reserve5H').value=s.reserve_5h_percent??10;document.getElementById('reserveLong').value=s.reserve_long_percent??10;document.getElementById('reserveStrict').checked=s.reserve_strict??true;document.getElementById('reserveFailClosed').checked=s.reserve_fail_closed??true;document.getElementById('reserveMargin').value=s.reserve_safety_margin_percent??2;document.getElementById('reserveInFlight').value=s.reserve_max_in_flight??1;document.getElementById('reserveBudget').value=s.reserve_request_budget_percent??0.25;document.getElementById('handleEnabled').checked=s.handle_enabled!==false;document.getElementById('usageFeedback').checked=s.enable_usage_feedback!==false;document.getElementById('enableResetProbe').checked=s.enable_reset_probe===true;document.getElementById('probeOnProvisionalRoster').checked=s.probe_on_provisional_roster===true;document.getElementById('monthlyMode').value=s.monthly_mode||'expiry_order';document.getElementById('scheduleAcrossPriorities').checked=s.schedule_across_priorities!==false;document.getElementById('enableManagedQuotaDisable').checked=s.enable_managed_quota_disable===true;document.getElementById('lifecycleEventLimit').value=s.lifecycle_event_limit||50;document.getElementById('refreshInterval').value=s.quota_refresh_interval||'30m0s';document.getElementById('staleAfter').value=s.stale_after||'5h0m0s';document.getElementById('refreshActiveWindow').value=s.refresh_active_window||'1h0m0s';document.getElementById('refreshAfterResetDelay').value=s.refresh_after_reset_delay||'1m0s';document.getElementById('refreshRetryDelays').value=s.refresh_retry_delays||'1m0s,5m0s,15m0s';document.getElementById('authFailureRetryInterval').value=s.auth_failure_retry_interval||'30m0s';document.getElementById('refreshOnStartup').checked=s.refresh_on_startup===true;document.getElementById('maxConcurrency').value=s.max_refresh_concurrency||1;document.getElementById('circuitFailureThreshold').value=s.circuit_failure_threshold||5;document.getElementById('circuitOpenDuration').value=s.circuit_open_duration||'30m0s';document.getElementById('circuitHalfOpenSuccessThreshold').value=s.circuit_half_open_success_threshold||2;document.getElementById('maxLogEntries').value=s.max_log_entries||200;document.getElementById('logRetention').value=s.log_retention||'24h0m0s';fillRetrySettings()}
+function fillSettings(){
+  const s=STATUS.settings||{};
+  for(const [id,key,fallback] of [['reserveDisable','reserve_disable_accounts',false],['reserveBudgetAuto','reserve_request_budget_auto',true],['reserveReport','usage_report_enabled',false]]){
+    document.getElementById(id).checked=s[key]??fallback;
+  }
+  for(const [id,key,fallback] of [['reserveBudgetMin','reserve_request_budget_min_percent',0.01],['reserveBudgetMax','reserve_request_budget_max_percent',2],['reserveReportMinutes','usage_report_interval_minutes',60]]){
+    document.getElementById(id).value=s[key]??fallback;
+  }
+  for(const id of ['reserveWebhook','reserveChatID'])document.getElementById(id).value='';
+  for(const id of ['reserveClearWebhook','reserveClearChat'])document.getElementById(id).checked=false;
+  document.getElementById('reserveWebhookState').textContent=t(s.webhook_configured?'reserve.configured':'reserve.unconfigured');
+  document.getElementById('reserveChatState').textContent=t(s.telegram_chat_id_configured?'reserve.configured':'reserve.unconfigured');
+  document.getElementById('reserveHistory').checked=s.history_enabled!==false;document.getElementById('reserveHistoryDays').value=s.history_retention_days??30;document.getElementById('reserveNotify').checked=s.notifications_enabled===true;document.getElementById('reserveNotifyKind').value=s.notification_kind??'generic';document.getElementById('reserveWarning').value=s.reserve_warning_percent??20;document.getElementById('reserveEnabled').checked=s.reserve_enabled??false;document.getElementById('reserve5H').value=s.reserve_5h_percent??10;document.getElementById('reserveLong').value=s.reserve_long_percent??10;document.getElementById('reserveStrict').checked=s.reserve_strict??true;document.getElementById('reserveFailClosed').checked=s.reserve_fail_closed??true;document.getElementById('reserveMargin').value=s.reserve_safety_margin_percent??2;document.getElementById('reserveInFlight').value=s.reserve_max_in_flight??1;document.getElementById('reserveBudget').value=s.reserve_request_budget_percent??0.25;document.getElementById('handleEnabled').checked=s.handle_enabled!==false;document.getElementById('usageFeedback').checked=s.enable_usage_feedback!==false;document.getElementById('enableResetProbe').checked=s.enable_reset_probe===true;document.getElementById('probeOnProvisionalRoster').checked=s.probe_on_provisional_roster===true;document.getElementById('monthlyMode').value=s.monthly_mode||'expiry_order';document.getElementById('scheduleAcrossPriorities').checked=s.schedule_across_priorities!==false;document.getElementById('enableManagedQuotaDisable').checked=s.enable_managed_quota_disable===true;document.getElementById('lifecycleEventLimit').value=s.lifecycle_event_limit||50;document.getElementById('refreshInterval').value=s.quota_refresh_interval||'30m0s';document.getElementById('staleAfter').value=s.stale_after||'5h0m0s';document.getElementById('refreshActiveWindow').value=s.refresh_active_window||'1h0m0s';document.getElementById('refreshAfterResetDelay').value=s.refresh_after_reset_delay||'1m0s';document.getElementById('refreshRetryDelays').value=s.refresh_retry_delays||'1m0s,5m0s,15m0s';document.getElementById('authFailureRetryInterval').value=s.auth_failure_retry_interval||'30m0s';document.getElementById('refreshOnStartup').checked=s.refresh_on_startup===true;document.getElementById('maxConcurrency').value=s.max_refresh_concurrency||1;document.getElementById('circuitFailureThreshold').value=s.circuit_failure_threshold||5;document.getElementById('circuitOpenDuration').value=s.circuit_open_duration||'30m0s';document.getElementById('circuitHalfOpenSuccessThreshold').value=s.circuit_half_open_success_threshold||2;document.getElementById('maxLogEntries').value=s.max_log_entries||200;document.getElementById('logRetention').value=s.log_retention||'24h0m0s';fillRetrySettings()
+}
 async function saveSettings(){try{if(!statusLoaded){await loadStatus();return}await requestManagement('/settings',{method:'PUT',body:collectSettingsPayload()});settingsDirty=false;showNotice(t('notice.settingsSaved'),false,'notice.settingsSaved');await refreshStatus({management:true,fillSettings:true})}catch(error){showNotice(error.message||String(error),true)}}
 async function refreshQuota(){try{await requestManagement('/refresh',{method:'POST'});showNotice(t('notice.refreshRequested'),false,'notice.refreshRequested');await refreshStatus({management:true});pollStatus(3,1200)}catch(error){showNotice(error.message||String(error),true)}}
 function splitTags(text){return text.split(',').map((item)=>item.trim()).filter(Boolean)}
@@ -1816,6 +1989,7 @@ document.getElementById('refreshQuota').addEventListener('click',refreshQuota);
 document.getElementById('refreshLogs').addEventListener('click',refreshLogs);
 document.getElementById('exportLogs').addEventListener('click',exportLogs);
 document.getElementById('exportConfig').addEventListener('click',exportConfig);
+document.getElementById('reserveTestNotify').addEventListener('click',testReserveNotification);
 document.getElementById('importConfig').addEventListener('click',()=>document.getElementById('importFile').click());
 document.getElementById('importFile').addEventListener('change',(event)=>importConfigFile(event.target.files&&event.target.files[0]));
 document.getElementById('saveAccount').addEventListener('click',saveAccountModal);

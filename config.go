@@ -22,7 +22,7 @@ const (
 	FallbackFillFirst FallbackMode = "fill-first"
 )
 
-var pluginVersion = "0.1.0"
+var pluginVersion = "0.2.0"
 
 type MonthlyMode string
 
@@ -197,6 +197,18 @@ func DefaultConfig() Config {
 
 func NormalizeConfig(cfg Config) Config {
 	defaults := DefaultConfig()
+	if cfg.UsageReportMinutes <= 0 {
+		cfg.UsageReportMinutes = defaults.UsageReportMinutes
+	}
+	if cfg.ReserveRequestBudgetMin <= 0 || cfg.ReserveRequestBudgetMin > 10 {
+		cfg.ReserveRequestBudgetMin = defaults.ReserveRequestBudgetMin
+	}
+	if cfg.ReserveRequestBudgetMax < cfg.ReserveRequestBudgetMin || cfg.ReserveRequestBudgetMax > 10 {
+		cfg.ReserveRequestBudgetMax = defaults.ReserveRequestBudgetMax
+		if cfg.ReserveRequestBudgetMax < cfg.ReserveRequestBudgetMin {
+			cfg.ReserveRequestBudgetMax = cfg.ReserveRequestBudgetMin
+		}
+	}
 	if cfg.QuotaRefreshInterval <= 0 {
 		cfg.QuotaRefreshInterval = defaults.QuotaRefreshInterval
 	}
