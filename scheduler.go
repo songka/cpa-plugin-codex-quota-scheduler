@@ -256,6 +256,9 @@ func accountAvailable(account AccountState, now time.Time) (bool, string) {
 }
 
 func accountQueueState(account AccountState, now time.Time) (QueueStatus, bool, string, time.Time) {
+	if account.UpstreamCooldownUntil.After(now) {
+		return QueueStatusUnavailable, false, account.UpstreamCooldownReason, account.UpstreamCooldownUntil
+	}
 	if account.Refresh.AuthFailure {
 		return QueueStatusUnavailable, false, "auth_failure", time.Time{}
 	}

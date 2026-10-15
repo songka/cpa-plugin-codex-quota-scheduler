@@ -120,7 +120,7 @@ func TestHandleMethodRegisterLoadsPersistedAnnotations(t *testing.T) {
 	}
 }
 
-func TestHandleMethodRegisterIgnoresInvalidPersistedAnnotations(t *testing.T) {
+func TestHandleMethodRegisterRejectsInvalidPersistedAnnotations(t *testing.T) {
 	cleanupIntegrationGlobals(t)
 
 	dir := t.TempDir()
@@ -135,17 +135,15 @@ func TestHandleMethodRegisterIgnoresInvalidPersistedAnnotations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("json.Marshal returned error: %v", err)
 	}
-	raw, err := handleMethod(pluginabi.MethodPluginRegister, rawReq)
-	if err != nil {
-		t.Fatalf("handle register: %v", err)
+	before := globalState.Config()
+	if _, err := handleMethod(pluginabi.MethodPluginRegister, rawReq); err == nil {
+		t.Fatal("corrupt persisted data must not be silently overwritten")
 	}
-
-	var env pluginabi.Envelope
-	if err := json.Unmarshal(raw, &env); err != nil {
-		t.Fatalf("decode envelope: %v", err)
+	if globalState.Config().QuotaRefreshInterval != before.QuotaRefreshInterval {
+		t.Fatal("failed configure changed active settings")
 	}
-	if !env.OK {
-		t.Fatalf("expected ok envelope, got %+v", env)
+	if raw, err := os.ReadFile(defaultStatePath()); err != nil || string(raw) != "{not-json" {
+		t.Fatalf("corrupt original was modified: %q, %v", raw, err)
 	}
 }
 

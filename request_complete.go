@@ -20,7 +20,11 @@ func handleRequestComplete(raw []byte) ([]byte, error) {
 			return nil, err
 		}
 	}
-	globalReserveLedger.release(completion.RequestID)
+	if completion.Outcome == pluginapi.RequestCompletionRejected {
+		globalReserveLedger.rollbackRejected(completion.RequestID)
+	} else {
+		globalReserveLedger.release(completion.RequestID)
+	}
 	handleRequestCompletionEvent(globalState, completion, time.Now())
 	return okEnvelope(struct{}{})
 }

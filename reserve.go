@@ -296,6 +296,7 @@ func reserveStatusForAccount(a AccountState, cfg Config, now time.Time) ReserveS
 // concurrency can recover a published account without waiting for another poll.
 func populateReserveView(view *AccountView, a AccountState, cfg Config, now time.Time) {
 	view.ID = a.AuthID
+	view.UpstreamCooldownUntil = a.UpstreamCooldownUntil
 	view.reserveBase = evaluateReserve(a, cfg, now)
 	view.reserveProjected = true
 	view.reserveFingerprint = a.CredentialFingerprint
@@ -395,17 +396,14 @@ func (l *reserveLedger) admit(id string, a AccountState, cfg Config, now time.Ti
 		s.Reason = "reserve_missing_request_id"
 		return s, false
 	}
-	old, exists := l.leases[id]
-	sameLease := exists && old.authID == a.AuthID
-	if exists && !sameLease {
+	// The host reuses the inbound ID across execution attempts. Retire the
+	// previous lease, not its charge, before considering this new attempt.
+	if _, exists := l.leases[id]; exists {
 		l.releaseLocked(id)
 	}
 	s.InFlight = l.counts[a.AuthID]
 	budget, samples := l.budgetLocked(a, cfg)
 	s.RequestBudget, s.BudgetSamples = budget, samples
-	if sameLease {
-		s.InFlight--
-	}
 	u := l.used[a.AuthID]
 	if a.LastSuccessAt.Before(u.observed) && a.CredentialFingerprint == u.fingerprint {
 		s.Blocked, s.Reason = true, "reserve_stale"
@@ -415,6 +413,10 @@ func (l *reserveLedger) admit(id string, a AccountState, cfg Config, now time.Ti
 		u = reserveLease{authID: a.AuthID, observed: a.LastSuccessAt, fingerprint: a.CredentialFingerprint}
 	}
 	s.EstimatedUnobserved = u.charged
+	if a.UpstreamCooldownUntil.After(now) {
+		s.Blocked, s.Reason = true, "upstream_cooldown"
+		return s, false
+	}
 	if s.Blocked {
 		return s, false
 	}
@@ -436,14 +438,33 @@ func (l *reserveLedger) admit(id string, a AccountState, cfg Config, now time.Ti
 	u.charged += budget
 	l.used[a.AuthID] = u
 	l.learning[a.AuthID].requests++
-	if !sameLease {
-		l.counts[a.AuthID]++
-	}
-	l.leases[id] = reserveLease{authID: a.AuthID}
+	l.counts[a.AuthID]++
+	l.leases[id] = reserveLease{authID: a.AuthID, observed: a.LastSuccessAt, charged: budget, fingerprint: a.CredentialFingerprint}
 	delete(l.rejected, a.AuthID)
 	s.InFlight++
 	s.EstimatedUnobserved = u.charged
 	return s, true
+}
+
+// A terminal interceptor rejection proves execution never began. Do not refund
+// ambiguous upstream errors, cancellation, or charges from another observation.
+func (l *reserveLedger) rollbackRejected(id string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	lease, ok := l.leases[id]
+	if !ok {
+		return
+	}
+	u := l.used[lease.authID]
+	if u.observed.Equal(lease.observed) && u.fingerprint == lease.fingerprint {
+		u.charged = math.Max(0, u.charged-lease.charged)
+		l.used[lease.authID] = u
+	}
+	if h := l.learning[lease.authID]; h != nil && h.baseline.LastSuccessAt.Equal(lease.observed) &&
+		h.baseline.CredentialFingerprint == lease.fingerprint && h.requests > 0 {
+		h.requests--
+	}
+	l.releaseLocked(id)
 }
 func handleReserveIntercept(raw []byte) ([]byte, error) {
 	var req pluginapi.RequestInterceptRequest

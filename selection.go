@@ -55,23 +55,24 @@ type AccountView struct {
 	ReserveBlocked bool
 	ReserveReason  string
 
-	ID                   string
-	AuthIndex            string
-	Instance             AuthInstanceID
-	PluginPriority       int
-	CPAPriority          int
-	Family               AccountFamily
-	Cache                CacheClass
-	LastKnownAvailable   bool
-	Exhausted            bool
-	ResetAt              time.Time
-	AuthBlocked          bool
-	Circuit              CircuitClass
-	TemporaryUnavailable bool
-	Trial                TrialState
-	Expiry               time.Time
-	RemainingQuota       float64
-	QuotaPressure        float64
+	ID                    string
+	AuthIndex             string
+	Instance              AuthInstanceID
+	PluginPriority        int
+	CPAPriority           int
+	Family                AccountFamily
+	Cache                 CacheClass
+	LastKnownAvailable    bool
+	Exhausted             bool
+	ResetAt               time.Time
+	AuthBlocked           bool
+	Circuit               CircuitClass
+	TemporaryUnavailable  bool
+	UpstreamCooldownUntil time.Time
+	Trial                 TrialState
+	Expiry                time.Time
+	RemainingQuota        float64
+	QuotaPressure         float64
 }
 
 type Candidate struct{ ID, Provider string }
@@ -88,6 +89,9 @@ type SelectionResult struct {
 }
 
 func ClassifyAccount(a AccountView, now time.Time) AvailabilityClass {
+	if a.UpstreamCooldownUntil.After(now) {
+		return Excluded
+	}
 	if a.ReserveFailClosed && !a.ReserveValidUntil.IsZero() && !now.Before(a.ReserveValidUntil) {
 		return Excluded
 	}

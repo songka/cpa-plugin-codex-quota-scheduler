@@ -365,6 +365,7 @@ type retryAttemptState struct {
 }
 
 type attemptResult struct {
+	authID    string
 	committed bool
 	retryable bool
 	reason    string
@@ -382,13 +383,14 @@ type attemptResult struct {
 // attempt produced client-visible output (or finished), retryable when the
 // failure justifies the next target, and neither when the failure must be
 // returned to the client as-is.
-func runRetryAttempt(ctx context.Context, cfg Config, exec pluginapi.ExecutorRequest, hostCallbackID string, state retryAttemptState, protocol string, pluginStreamID string, deadline time.Time) attemptResult {
+func runRetryAttempt(ctx context.Context, cfg Config, exec pluginapi.ExecutorRequest, hostCallbackID string, state retryAttemptState, protocol string, pluginStreamID string, deadline time.Time) (out attemptResult) {
 	nestedID, result, ready := openNestedStream(cfg, exec, hostCallbackID, state, protocol)
 	if !ready {
 		return result
 	}
 	nestedOpen := true
 	defer func() {
+		recordNestedFailureCooldown(result.authID, out)
 		if nestedOpen {
 			closeNestedStream(nestedID)
 		}
@@ -485,13 +487,14 @@ func runRetryAttempt(ctx context.Context, cfg Config, exec pluginapi.ExecutorReq
 }
 
 // openNestedStream issues one nested execution through the host.
-func openNestedStream(cfg Config, exec pluginapi.ExecutorRequest, hostCallbackID string, state retryAttemptState, protocol string) (string, attemptResult, bool) {
+func openNestedStream(cfg Config, exec pluginapi.ExecutorRequest, hostCallbackID string, state retryAttemptState, protocol string) (stream string, out attemptResult, ready bool) {
 	authID, leaseID, admitErr := reserveNestedAdmit(cfg, state.target.Provider)
 	if admitErr != nil {
 		return "", attemptResult{reason: admitErr.Error()}, false
 	}
 	leaseTransferred := false
 	defer func() {
+		recordNestedFailureCooldown(authID, out)
 		if !leaseTransferred && leaseID != "" {
 			globalReserveLedger.release(leaseID)
 		}
@@ -547,7 +550,20 @@ func openNestedStream(cfg Config, exec pluginapi.ExecutorRequest, hostCallbackID
 		nestedReserveLeases.Store(streamID, leaseID)
 		leaseTransferred = true
 	}
-	return streamID, attemptResult{}, true
+	return streamID, attemptResult{authID: authID}, true
+}
+
+func recordNestedFailureCooldown(authID string, result attemptResult) {
+	if authID == "" || !result.retryable || strings.Contains(result.reason, "quota_reserve_unavailable") {
+		return
+	}
+	now := time.Now()
+	if globalState.RecordUpstreamCooldown(authID, "", "upstream_cooldown", now) {
+		globalState.RecordLog("warn", "upstream.cooldown", "上游临时失败，账号短期冷却", map[string]any{
+			"auth_id": authID, "status_code": result.status, "kind": result.kind,
+		}, now)
+		publishSchedulerState(globalState, nil, now)
+	}
 }
 
 // forwardCommitted flushes the hold buffer and switches the attempt to

@@ -1,8 +1,16 @@
 # Codex Quota Reserve 安装与回滚手册
 
-独立插件 ID：`codex-quota-reserve`。目标宿主：**CLIProxyAPI v8.0.27**。发行版本：**0.2.1**。发布仓库：`songka/cpa-plugin-codex-quota-scheduler`。
+独立插件 ID：`codex-quota-reserve`。目标宿主：**CLIProxyAPI v8.0.27**。发行版本：**0.2.2**。发布仓库：`songka/cpa-plugin-codex-quota-scheduler`。
 
 基于 Jeffery 的 MIT Codex Quota Scheduler v0.3.2 改造。[原版中文说明](docs/upstream/README.zh-CN.md)保留成熟功能的详细说明。
+
+## v0.2.2 主要更新
+
+- 可归属到账号的上游临时失败增加 30 秒冷却；严格额度保护的嵌套重试切换其他安全账号，后续选号跳过失败账号，到期自动恢复。
+- 宿主 YAML 的显式字段逐项覆盖历史配置，未传入的字段、私有 Webhook 和账号注释保留；持久化失败时返回错误，不先修改运行配置。
+- 明确在执行前被拒绝的请求回滚最后一次准入预算。真实重试仍独立估算，503、断线、超时不能证明未消耗额度，不盲目退款。
+- 额度保护开启且刷新间隔超过 5 分钟时显示警告。保留恢复围栏对陈旧额度重放的保护，补充相等时间戳的回归验证。
+- 逐项核对与边界见[自检报告](docs/reserve-audit-2026-10-15.md)。after-auth 已终止请求仍不能在 CPA v8.0.27 内重新选路。
 
 ## v0.2.1 主要更新
 
@@ -47,7 +55,7 @@ plugins:
       quota_refresh_interval: 5m
 ```
 
-使用现有公开仓库发布；商店安装需要 v0.2.1 Release 中存在对应架构 ZIP 和 `checksums.txt`。开发验收阶段也可将经过 SHA256 检查的对应架构 `.so` 放入挂载的插件目录。文件名必须为 `codex-quota-reserve.so`。插件库地址保持不变，版本由 GitHub 最新正式 Release 自动发现。CPA v8.0.27 缓存最新版本查询一小时，发布后仍显示旧版本时可等缓存过期，或备份后重启 CPA 再刷新插件库。
+使用现有公开仓库发布；商店安装需要 v0.2.2 Release 中存在对应架构 ZIP 和 `checksums.txt`。开发验收阶段也可将经过 SHA256 检查的对应架构 `.so` 放入挂载的插件目录。文件名必须为 `codex-quota-reserve.so`。插件库地址保持不变，版本由 GitHub 最新正式 Release 自动发现。CPA v8.0.27 缓存最新版本查询一小时，发布后仍显示旧版本时可等缓存过期，或备份后重启 CPA 再刷新插件库。
 
 ## 迁移与启用
 
@@ -91,16 +99,16 @@ plugins:
 ```sh
 make test vet
 go test -race -run '^TestReserve' -count=1 ./...
-make package VERSION=0.2.1
-make checksums VERSION=0.2.1
+make package VERSION=0.2.2
+make checksums VERSION=0.2.2
 bash scripts/test-host-integration.sh
 ```
 
 GitHub Actions 在 PR 时执行格式检查、回归、race 检查、真实宿主动态加载集成测试和双架构原生构建。配置带 required reviewers 的 `release-approval` GitHub Environment。测试完成并得到用户批准后才可以：
 
 ```sh
-git tag -a v0.2.1 -m "v0.2.1"
-git push origin v0.2.1
+git tag -a v0.2.2 -m "v0.2.2"
+git push origin v0.2.2
 ```
 
 仓库沿用现有名称；插件 ID、动态库和发行 ZIP 基名仍为 `codex-quota-reserve`，保持独立运行身份。参阅[验证记录和限制](docs/reserve-validation.md)。原 [MIT 许可证](LICENSE)和版权保留；正式再分发前需核对依赖许可证。

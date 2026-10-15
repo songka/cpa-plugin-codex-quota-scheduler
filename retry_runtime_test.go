@@ -21,6 +21,7 @@ type fakeRetryAttempt struct {
 }
 
 type fakeNestedRequest struct {
+	AuthID   string
 	Model    string
 	Provider string
 	Body     []byte
@@ -63,6 +64,7 @@ func (h *fakeRetryHost) call(method string, payload any) (json.RawMessage, error
 	case pluginabi.MethodHostModelExecuteStream:
 		request, _ := payload.(hostModelExecutionRequest)
 		h.requests = append(h.requests, fakeNestedRequest{
+			AuthID:   request.AuthID,
 			Model:    request.Model,
 			Provider: request.ForcedProvider,
 			Body:     append([]byte(nil), request.Body...),

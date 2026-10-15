@@ -350,6 +350,32 @@ func (s *PluginState) RecordAccountSuccess(authID, authIndex string, now time.Ti
 	return cloneAccountState(account), true
 }
 
+// Only authoritative, known Codex accounts can acquire a transient request cooldown.
+func (s *PluginState) RecordUpstreamCooldown(authID, authIndex, reason string, now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key, account, ok := s.findAccountLocked(authID, authIndex)
+	if !ok || account.Provider != "codex" {
+		return false
+	}
+	until := now.Add(30 * time.Second)
+	if until.After(account.UpstreamCooldownUntil) {
+		account.UpstreamCooldownUntil = until
+		account.UpstreamCooldownReason = reason
+		s.accounts[key] = account
+	}
+	return true
+}
+
+func (s *PluginState) preserveRequestCooldownLocked(account *AccountState) {
+	if _, existing, ok := s.findAccountLocked(account.AuthID, account.AuthIndex); ok &&
+		existing.CredentialFingerprint == account.CredentialFingerprint &&
+		existing.UpstreamCooldownUntil.After(account.UpstreamCooldownUntil) {
+		account.UpstreamCooldownUntil = existing.UpstreamCooldownUntil
+		account.UpstreamCooldownReason = existing.UpstreamCooldownReason
+	}
+}
+
 // ClearAccountTemporaryExhausted drops a stale temporary-exhaustion marker for
 // one account. Callers must hold verified recovery evidence: either a
 // successful real request (RecordAccountSuccess) or an operator-requested
@@ -549,6 +575,7 @@ func (s *PluginState) ApplyQuotaRefreshFailureIfAdmissionCurrent(account Account
 	if !s.admissionCurrentLocked(account.AuthID, version) {
 		return false
 	}
+	s.preserveRequestCooldownLocked(&account)
 	account.Priority = s.admissionPriorityLocked(account.AuthID)
 	account.LastError = message
 	account.Refresh.LastFailureKind = kind
@@ -578,6 +605,7 @@ func (s *PluginState) ApplyQuotaRefreshSuccessIfAdmissionCurrent(account Account
 	if !s.admissionCurrentLocked(account.AuthID, version) {
 		return false
 	}
+	s.preserveRequestCooldownLocked(&account)
 	account.Priority = s.admissionPriorityLocked(account.AuthID)
 	if !account.LastSuccessAt.IsZero() && account.LastError == "" {
 		account.Refresh = AccountRefreshState{}

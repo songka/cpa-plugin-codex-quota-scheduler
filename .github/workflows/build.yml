@@ -44,7 +44,7 @@ jobs:
           RELEASE_TYPE: ${{ github.ref_type }}
         run: |
           set -euo pipefail
-          VERSION=0.2.1-dev
+          VERSION=0.2.2-dev
           if [[ "$RELEASE_TYPE" == tag ]]; then VERSION="${RELEASE_REF#v}"; fi
           make package VERSION="$VERSION"
           cd dist

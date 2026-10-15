@@ -141,6 +141,8 @@ func fallbackUnavailableSummary(snapshot SchedulerSnapshot, candidates []Candida
 
 func accountExclusionReason(a AccountView, now time.Time) string {
 	switch {
+	case a.UpstreamCooldownUntil.After(now):
+		return "upstream_cooldown"
 	case a.ReserveBlocked:
 		return a.ReserveReason
 	case a.AuthBlocked:
@@ -210,8 +212,9 @@ func accountViewFromState(a AccountState, cfg Config, now time.Time, trials *Tri
 		PluginPriority: a.Annotation.SchedulerPriority, CPAPriority: a.Priority, Family: a.Family,
 		Cache: cache, LastKnownAvailable: a.LastError == "", Exhausted: exhausted,
 		ResetAt: reset, AuthBlocked: a.Refresh.AuthFailure, Circuit: circuitClass,
-		TemporaryUnavailable: a.TemporaryExhausted && a.TemporaryResetAt.After(now),
-		Trial:                trial, Expiry: accountSortTime(a), RemainingQuota: remainingQuota(a), QuotaPressure: quotaPressure(a, now),
+		TemporaryUnavailable:  a.TemporaryExhausted && a.TemporaryResetAt.After(now),
+		UpstreamCooldownUntil: a.UpstreamCooldownUntil,
+		Trial:                 trial, Expiry: accountSortTime(a), RemainingQuota: remainingQuota(a), QuotaPressure: quotaPressure(a, now),
 	}
 	populateReserveView(&view, a, cfg, now)
 	applyReserveStatus(&view, globalReserveLedger.statusForView(view, now))

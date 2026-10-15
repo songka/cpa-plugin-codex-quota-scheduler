@@ -101,19 +101,33 @@ func configure(raw []byte) error {
 			return err
 		}
 	}
-	cfg, err := DecodeConfig(req.ConfigYAML)
+	disk, loadedDisk, err := loadUserDataWithMigration(semanticStatePaths(defaultStatePath()), OSFileHooks(), nil)
+	if err != nil {
+		return fmt.Errorf("load plugin user data: %w", err)
+	}
+	base := DefaultConfig()
+	if loadedDisk {
+		base = disk.Config
+	}
+	cfg, err := decodeConfigOnBase(req.ConfigYAML, base)
 	if err != nil {
 		return err
 	}
-	disk, loadedDisk, err := loadUserDataWithMigration(semanticStatePaths(defaultStatePath()), OSFileHooks(), nil)
-	if err == nil && loadedDisk {
-		cfg = disk.Config
-	} else {
-		disk = PluginDiskState{Config: cfg}
+	for _, annotation := range disk.Accounts {
+		if err := validateReserveOverride(annotation.ReserveOverride, cfg.ReservePolicy); err != nil {
+			return err
+		}
+	}
+	disk.Config = cfg
+	if err := SaveUserData(semanticStatePaths(defaultStatePath()).UserData, disk); err != nil {
+		return fmt.Errorf("save plugin user data: %w", err)
 	}
 	currentConfig.Store(cfg)
 	globalState.ReplaceConfig(cfg)
 	globalState.SetAnnotations(AnnotationState{Accounts: disk.Accounts, Groups: disk.Groups})
+	if warning := reserveRefreshWarning(cfg); warning != "" {
+		globalState.RecordLog("warn", "reserve.refresh_interval", warning, nil, time.Now())
+	}
 	startEvidenceConsumer()
 	publishSchedulerState(globalState, nil, time.Now())
 	return nil
@@ -261,7 +275,7 @@ func handleUsageHandle(raw []byte) ([]byte, error) {
 			}
 		}
 	}
-	if quotaLimitFeedback && snapshot != nil {
+	if (quotaLimitFeedback || isTransientUsageFailure(record)) && snapshot != nil {
 		publishSchedulerState(globalState, snapshot.ActiveHighestTier, now)
 	}
 	if quotaLimitFeedback {

@@ -1,8 +1,16 @@
 # Codex Quota Reserve
 
-Independent CPA dynamic plugin `codex-quota-reserve`, targeting **CLIProxyAPI v8.0.27**, based on Jeffery's MIT Codex Quota Scheduler v0.3.2. Release version **0.2.1**, distributed from the existing public repository `songka/cpa-plugin-codex-quota-scheduler`.
+Independent CPA dynamic plugin `codex-quota-reserve`, targeting **CLIProxyAPI v8.0.27**, based on Jeffery's MIT Codex Quota Scheduler v0.3.2. Release version **0.2.2**, distributed from the existing public repository `songka/cpa-plugin-codex-quota-scheduler`.
 
 [中文安装与回滚手册](README.zh-CN.md) · [Upstream documentation](docs/upstream/README.md)
+
+## v0.2.2 Highlights
+
+- Attributed transient upstream failures receive a 30-second account cooldown. Nested strict-reserve retries switch to another safe account, and subsequent selection skips the failed account until expiry.
+- Explicit host YAML fields override persisted settings individually; omitted fields, private Webhook settings and account annotations survive. Persistence failures are reported before activating settings.
+- Only confirmed pre-execution rejections refund their last admitted attempt. Actual retries still consume separate estimates; ambiguous 503/transport failures are not assumed free.
+- Reserve refresh intervals above five minutes show a management warning. The recovery fence retains stale-observation protection, including equal timestamps.
+- See [the itemized audit](docs/reserve-audit-2026-10-15.md) for tests and the remaining CPA after-auth rerouting limitation.
 
 ## v0.2.1 Highlights
 
@@ -29,14 +37,14 @@ Go 1.26+, CGO, GCC and Make are required. Linux glibc is required; these shared 
 make test vet
 # Meaningful reserve concurrency checks:
 go test -race -run '^TestReserve' -count=1 ./...
-make package VERSION=0.2.1
-make checksums VERSION=0.2.1
+make package VERSION=0.2.2
+make checksums VERSION=0.2.2
 bash scripts/test-host-integration.sh
 ```
 
 The integration runner checks out the exact v8.0.27 commit, loads the actual `.so` into the actual host loader and uses simulated OAuth quota responses. It does not send real model requests or modify production CPA. It verifies settings/history/import/export, quota parsing, selection, terminal rejection and after-auth admission. The host's own Manager terminal rejection tests run separately. See [validation and limits](docs/reserve-validation.md) for coverage boundaries.
 
-Native AMD64 and ARM64 GitHub Actions runners produce `codex-quota-reserve_0.2.1_linux_<arch>.zip` and SHA256 files. For cross compilation, set `CC` to an ARM64 C compiler; packaging always runs its Go helper on the native platform.
+Native AMD64 and ARM64 GitHub Actions runners produce `codex-quota-reserve_0.2.2_linux_<arch>.zip` and SHA256 files. For cross compilation, set `CC` to an ARM64 C compiler; packaging always runs its Go helper on the native platform.
 
 ## Configuration
 
@@ -91,8 +99,8 @@ Set up GitHub Environment `release-approval` with required reviewers. Tags run f
 
 ```sh
 # Approval and passing host/platform tests are prerequisites.
-git tag -a v0.2.1 -m "v0.2.1"
-git push origin v0.2.1
+git tag -a v0.2.2 -m "v0.2.2"
+git push origin v0.2.2
 ```
 
 The repository name is retained; the plugin ID and archive basename remain `codex-quota-reserve`, so the plugin keeps an independent runtime identity.

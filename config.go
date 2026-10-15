@@ -22,7 +22,7 @@ const (
 	FallbackFillFirst FallbackMode = "fill-first"
 )
 
-var pluginVersion = "0.2.1"
+var pluginVersion = "0.2.2"
 
 type MonthlyMode string
 
@@ -278,7 +278,11 @@ func NormalizeConfig(cfg Config) Config {
 }
 
 func DecodeConfig(raw []byte) (Config, error) {
-	cfg := DefaultConfig()
+	return decodeConfigOnBase(raw, DefaultConfig())
+}
+
+// Host YAML overrides only supplied keys; private-only settings and secrets survive.
+func decodeConfigOnBase(raw []byte, cfg Config) (Config, error) {
 	if len(raw) == 0 {
 		return cfg, nil
 	}
@@ -504,6 +508,13 @@ func DecodeConfig(raw []byte) (Config, error) {
 		cfg.RetryChain = chain
 	}
 	return NormalizeConfig(cfg), nil
+}
+
+func reserveRefreshWarning(cfg Config) string {
+	if cfg.ReserveEnabled && cfg.QuotaRefreshInterval > 5*time.Minute {
+		return "额度保护的配额刷新间隔超过 5 分钟，预估消耗对账和主动重置恢复可能延迟；建议设为 5m 或更短。"
+	}
+	return ""
 }
 
 // parseByteSize accepts "8388608" or a suffixed size such as "8MB" or "1.5GiB".

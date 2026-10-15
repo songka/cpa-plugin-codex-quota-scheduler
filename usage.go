@@ -67,6 +67,11 @@ func HandleUsageFeedback(state *PluginState, record pluginapi.UsageRecord, now t
 	if state == nil || !state.Config().EnableUsageFeedback {
 		return
 	}
+	if isTransientUsageFailure(record) && state.RecordUpstreamCooldown(record.AuthID, record.AuthIndex, "upstream_cooldown", now) {
+		state.RecordLog("warn", "upstream.cooldown", "上游临时失败，账号短期冷却", map[string]any{
+			"auth_id": record.AuthID, "auth_index": record.AuthIndex, "status_code": record.Failure.StatusCode,
+		}, now)
+	}
 	if record.Provider == "codex" && !record.Failed {
 		// Real responses may carry an embedded quota snapshot (usage-record
 		// response headers on the WebSocket transport); observing it keeps the
@@ -106,6 +111,20 @@ func HandleUsageFeedback(state *PluginState, record pluginapi.UsageRecord, now t
 		"reason":     event.Reason,
 		"reset_at":   formatTime(event.ResetAt),
 	}, now)
+}
+
+func isTransientUsageFailure(record pluginapi.UsageRecord) bool {
+	if record.Provider != "codex" || !record.Failed || strings.Contains(record.Failure.Body, "quota_reserve_unavailable") {
+		return false
+	}
+	if _, quotaFailure := DetectQuotaFailure(record, time.Time{}); quotaFailure {
+		return false
+	}
+	classification := classifyRetryStatus(record.Failure.StatusCode)
+	if record.Failure.StatusCode == 0 {
+		classification = classifyRetryFailure(record.Failure.Body)
+	}
+	return classification.Retryable
 }
 
 func shouldRecordCircuitSuccess(state *PluginState, record pluginapi.UsageRecord, now time.Time) (recordSuccess, temporaryActive bool) {

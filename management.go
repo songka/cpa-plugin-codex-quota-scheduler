@@ -24,6 +24,7 @@ var managementManagedRecoverySoon = func(authID string) error { return nil }
 var managementProvisionalRiskChanged = func(bool) {}
 
 type StatusPayload struct {
+	ConfigurationWarning  string                 `json:"configuration_warning,omitempty"`
 	PluginID              string                 `json:"plugin_id"`
 	GeneratedAt           time.Time              `json:"generated_at"`
 	Shell                 bool                   `json:"shell,omitempty"`
@@ -785,6 +786,7 @@ func buildStatusPayload(snapshot StateSnapshot, ordered []ScheduledAccount, life
 	}
 
 	payload := StatusPayload{
+		ConfigurationWarning:  reserveRefreshWarning(snapshot.Config),
 		PluginID:              PluginID,
 		GeneratedAt:           snapshot.Now,
 		MonthlyMode:           snapshot.Config.MonthlyMode,
@@ -1891,9 +1893,12 @@ const DUE_REASON_LABELS={
   'zh-CN':{stale:'额度缓存过期',never_refreshed:'尚未刷新',retry_due:'重试时间已到',retry_wait:'等待重试',refresh_interval_due:'刷新间隔已到',five_hour_reset_due:'5 小时重置已到',long_window_reset_due:'长额度重置已到',temporary_reset_due:'主动重置已到',circuit_wait:'熔断等待',circuit_probe_due:'熔断探测已到',auth_failure:'认证异常',local_failure:'本地认证异常'}
 };
 const UNAVAILABLE_REASON_LABELS={
+  // Keep transient upstream failures distinct from quota exhaustion.
   en:{normal:'Normal',reserve_five_hour:'5-hour reserve protection',reserve_long_window:'Weekly/monthly reserve protection',reserve_multi_window:'Multiple windows protected',reserve_unknown:'Quota unknown',reserve_stale:'Quota cache expired',reserve_waiting_reset:'Waiting for confirmed reset',reserve_invalid_threshold:'Invalid reserve settings',upstream_429_cooldown:'Upstream 429 cooldown',upstream_quota_exhausted:'Upstream quota exhausted',reserve_concurrency:'In-flight limit reached',reserve_budget:'Unobserved consumption budget reached',auth_failure:'Authentication needs re-login',local_failure:'Local auth data needs attention',stale_quota:'Quota data is stale or pending refresh',circuit_open:'Circuit open',quota_probe_wait:'Quota probe wait',temporary_exhausted:'Temporarily exhausted',five_hour_exhausted:'5-hour quota exhausted',weekly_exhausted:'Weekly quota exhausted',monthly_exhausted:'Monthly quota exhausted',unknown_account:'Unknown account'},
   'zh-CN':{normal:'正常可用',reserve_five_hour:'5 小时额度保护',reserve_long_window:'周/月额度保护',reserve_multi_window:'多窗口同时保护',reserve_unknown:'额度未知',reserve_stale:'额度缓存过期',reserve_waiting_reset:'等待确认额度恢复',reserve_invalid_threshold:'保护阈值无效',upstream_429_cooldown:'上游 429 冷却',upstream_quota_exhausted:'上游额度真正耗尽',reserve_concurrency:'在途请求已达到限制',reserve_budget:'未确认消耗预算已达到限制',auth_failure:'认证异常',local_failure:'本地认证异常',stale_quota:'额度缓存过期',circuit_open:'熔断中',quota_probe_wait:'等待额度探测',temporary_exhausted:'临时额度耗尽',five_hour_exhausted:'5 小时额度耗尽',weekly_exhausted:'周额度耗尽',monthly_exhausted:'月额度耗尽',unknown_account:'未知账号'}
 };
+UNAVAILABLE_REASON_LABELS.en.upstream_cooldown='Upstream temporarily unavailable; cooling down';
+UNAVAILABLE_REASON_LABELS['zh-CN'].upstream_cooldown='上游暂时不可用，冷却中';
 function normalizeLocale(raw){return String(raw||'').toLowerCase().startsWith('zh')?'zh-CN':'en'}
 function storedLocale(){try{const locale=window.localStorage.getItem(LOCALE_STORAGE_KEY);return locale==='zh-CN'||locale==='en'?locale:''}catch(error){return''}}
 function parentLocale(){try{if(window.parent===window)return'';const language=String(window.parent.document.documentElement.lang||'').trim().toLowerCase();if(!language)return'';return language.startsWith('zh')?'zh-CN':'en'}catch(error){return''}}
@@ -1919,7 +1924,7 @@ function hasManagementKey(){const input=document.getElementById('managementKey')
 function settingsFocusedOrDirty(){const panels=[document.getElementById('settingsPanel'),document.getElementById('retryPanel')];return settingsDirty||panels.some((panel)=>panel&&panel.contains(document.activeElement))}
 function updateResetProbeWarning(){const warning=document.getElementById('resetProbeWarning');if(warning)warning.hidden=!(statusLoaded&&STATUS.settings&&STATUS.settings.enable_reset_probe!==true)}
 function updateProtectedVisibility(){const loaded=statusLoaded;const show=(id,visible)=>{const item=document.getElementById(id);if(item)item.hidden=!visible};show('settingsPanel',loaded);show('retryPanelWrap',loaded);show('protectedMain',loaded);show('refreshQuota',loaded);show('loadData',!loaded);updateResetProbeWarning()}
-function renderRosterLifecycle(){const warning=document.getElementById('rosterLifecycleWarning');const title=document.getElementById('rosterLifecycleTitle');const body=document.getElementById('rosterLifecycleBody');if(!warning||!title||!body)return;const roster=STATUS.roster||{};const messages=[roster.warning,roster.risk_warning].filter(Boolean);warning.hidden=messages.length===0;title.textContent=[roster.capability,roster.health].filter(Boolean).join(' / ')||'Roster lifecycle';body.textContent=messages.join(' ')}
+function renderRosterLifecycle(){const warning=document.getElementById('rosterLifecycleWarning');const title=document.getElementById('rosterLifecycleTitle');const body=document.getElementById('rosterLifecycleBody');if(!warning||!title||!body)return;const roster=STATUS.roster||{};const messages=[roster.warning,roster.risk_warning,STATUS.configuration_warning].filter(Boolean);warning.hidden=messages.length===0;title.textContent=[roster.capability,roster.health].filter(Boolean).join(' / ')||'Configuration';body.textContent=messages.join(' ')}
 function applyStatus(data,options){STATUS=data;statusLoaded=true;rebuildDerivedState();const shouldFillSettings=(options&&options.fillSettings)||!settingsInitialized||!settingsFocusedOrDirty();if(shouldFillSettings){fillSettings();settingsInitialized=true}renderMetrics();renderRosterLifecycle();renderAccounts(STATUS.accounts||[]);renderLogs(STATUS.logs||[]);updateProtectedVisibility();applyLocale();if(statusLoaded)refreshRetryStats()}
 async function refreshStatus(options){const opts=options||{};const data=await requestManagement('/status',{query:{format:'json'}});applyStatus(data,opts)}
 function startStatusPolling(){if(statusPollID)return;statusPollID=window.setInterval(()=>refreshStatus({management:true}).catch(()=>{}),15000)}
