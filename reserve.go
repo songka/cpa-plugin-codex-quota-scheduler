@@ -7,6 +7,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	"math"
 	"net/http"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -221,19 +222,163 @@ type reserveLedger struct {
 	used     map[string]reserveLease
 	counts   map[string]int
 	learning map[string]*requestBudgetLearning
+	rejected map[string]reserveRejection
+}
+
+const reserveDynamicStatusTTL = 2 * time.Minute
+
+type reserveRejection struct {
+	reason   string
+	observed time.Time
+	at       time.Time
 }
 
 var globalReserveLedger = newReserveLedger()
 
 func newReserveLedger() *reserveLedger {
-	return &reserveLedger{leases: make(map[string]reserveLease), used: make(map[string]reserveLease), counts: make(map[string]int), learning: make(map[string]*requestBudgetLearning)}
+	return &reserveLedger{
+		leases:   make(map[string]reserveLease),
+		used:     make(map[string]reserveLease),
+		counts:   make(map[string]int),
+		learning: make(map[string]*requestBudgetLearning),
+		rejected: make(map[string]reserveRejection),
+	}
 }
 func (l *reserveLedger) release(id string) { l.mu.Lock(); defer l.mu.Unlock(); l.releaseLocked(id) }
 func (l *reserveLedger) releaseLocked(id string) {
 	if lease, ok := l.leases[id]; ok {
 		l.counts[lease.authID]--
 		delete(l.leases, id)
+		if l.counts[lease.authID] <= 0 {
+			delete(l.counts, lease.authID)
+			if rejection, ok := l.rejected[lease.authID]; ok && rejection.reason == "reserve_concurrency" {
+				delete(l.rejected, lease.authID)
+			}
+		}
 	}
+}
+
+func (l *reserveLedger) recordRejection(authID, reason string, observed, now time.Time) {
+	if authID == "" || reason == "" {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.rejected[authID] = reserveRejection{reason: reason, observed: observed, at: now}
+}
+
+// Missing quota records must remain visible without adding interceptor input
+// to the authoritative auth roster.
+func (l *reserveLedger) unknownRejections(now time.Time) []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var ids []string
+	for id, rejection := range l.rejected {
+		if now.Before(rejection.at) || now.Sub(rejection.at) >= reserveDynamicStatusTTL {
+			delete(l.rejected, id)
+			continue
+		}
+		if rejection.reason == "reserve_unknown" {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func reserveStatusForAccount(a AccountState, cfg Config, now time.Time) ReserveStatus {
+	var view AccountView
+	populateReserveView(&view, a, cfg, now)
+	return globalReserveLedger.statusForView(view, now)
+}
+
+// Keep the published quota verdict separate from live reservations so releasing
+// concurrency can recover a published account without waiting for another poll.
+func populateReserveView(view *AccountView, a AccountState, cfg Config, now time.Time) {
+	view.ID = a.AuthID
+	view.reserveBase = evaluateReserve(a, cfg, now)
+	view.reserveProjected = true
+	view.reserveFingerprint = a.CredentialFingerprint
+	view.ReserveCapacity = 100
+	view.ReserveObservedAt = a.LastSuccessAt
+	view.ReserveMaxInFlight = maxReserveInFlight(cfg.ReserveMaxInFlight)
+	view.ReserveFailClosed = cfg.ReserveEnabled && cfg.ReserveFailClosed
+	if cfg.ReserveEnabled {
+		view.reserveBase.RequestBudget, view.reserveBase.BudgetSamples = globalReserveLedger.requestBudget(a, cfg)
+		for _, w := range []struct {
+			quota *QuotaWindow
+			line  float64
+		}{{a.Quota.FiveHour, view.reserveBase.FiveHourStopLine}, {a.Quota.LongWindow, view.reserveBase.LongStopLine}} {
+			if w.quota == nil {
+				continue
+			}
+			if w.quota.UsedPercent != nil {
+				view.ReserveCapacity = math.Min(view.ReserveCapacity, 100-*w.quota.UsedPercent-w.line)
+			}
+			if !w.quota.ResetAt.IsZero() && (view.reserveResetAt.IsZero() || w.quota.ResetAt.Before(view.reserveResetAt)) {
+				view.reserveResetAt = w.quota.ResetAt
+			}
+		}
+	}
+	view.ReserveBudget = view.reserveBase.RequestBudget
+	applyReserveStatus(view, view.reserveBase)
+}
+
+func applyReserveStatus(view *AccountView, status ReserveStatus) {
+	view.ReserveBlocked = status.Blocked
+	view.ReserveReason = status.Reason
+	view.ReserveValidUntil = status.ValidUntil
+}
+
+func (l *reserveLedger) statusForView(a AccountView, now time.Time) ReserveStatus {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	s := a.reserveBase
+	if !a.reserveProjected {
+		s = ReserveStatus{Enabled: true, Blocked: a.ReserveBlocked, Reason: a.ReserveReason, RequestBudget: a.ReserveBudget, ValidUntil: a.ReserveValidUntil}
+	}
+	if !s.Enabled {
+		return s
+	}
+	s.InFlight = l.counts[a.ID]
+	u := l.used[a.ID]
+	if a.ReserveObservedAt.Equal(u.observed) && a.reserveFingerprint == u.fingerprint {
+		s.EstimatedUnobserved = u.charged
+	}
+	block := func(reason string) ReserveStatus { s.Blocked, s.Reason = true, reason; return s }
+	if s.Blocked {
+		return s
+	}
+	if a.ReserveFailClosed && !s.ValidUntil.IsZero() && !now.Before(s.ValidUntil) {
+		return block("reserve_stale")
+	}
+	if a.ReserveFailClosed && !a.reserveResetAt.IsZero() && !now.Before(a.reserveResetAt) {
+		return block("reserve_waiting_reset")
+	}
+	if a.ReserveObservedAt.Before(u.observed) && a.reserveFingerprint == u.fingerprint {
+		return block("reserve_stale")
+	}
+	if a.ReserveMaxInFlight > 0 && s.InFlight >= a.ReserveMaxInFlight {
+		return block("reserve_concurrency")
+	}
+	if s.EstimatedUnobserved+s.RequestBudget >= a.ReserveCapacity {
+		return block("reserve_budget")
+	}
+	if rejection, ok := l.rejected[a.ID]; ok {
+		if !rejection.observed.Equal(a.ReserveObservedAt) || now.Before(rejection.at) || now.Sub(rejection.at) >= reserveDynamicStatusTTL {
+			delete(l.rejected, a.ID)
+		} else if rejection.reason == "reserve_missing_request_id" {
+			return block(rejection.reason)
+		}
+	}
+	return s
+}
+
+func maxReserveInFlight(value int) int {
+	if value < 1 {
+		return 1
+	}
+	return value
 }
 
 // The check and allocation share one mutex. Estimated charges remain until fresh
@@ -262,7 +407,7 @@ func (l *reserveLedger) admit(id string, a AccountState, cfg Config, now time.Ti
 		s.InFlight--
 	}
 	u := l.used[a.AuthID]
-	if a.LastSuccessAt.Before(u.observed) {
+	if a.LastSuccessAt.Before(u.observed) && a.CredentialFingerprint == u.fingerprint {
 		s.Blocked, s.Reason = true, "reserve_stale"
 		return s, false
 	}
@@ -273,7 +418,7 @@ func (l *reserveLedger) admit(id string, a AccountState, cfg Config, now time.Ti
 	if s.Blocked {
 		return s, false
 	}
-	if s.InFlight >= cfg.ReserveMaxInFlight {
+	if s.InFlight >= maxReserveInFlight(cfg.ReserveMaxInFlight) {
 		s.Blocked = true
 		s.Reason = "reserve_concurrency"
 		return s, false
@@ -295,6 +440,7 @@ func (l *reserveLedger) admit(id string, a AccountState, cfg Config, now time.Ti
 		l.counts[a.AuthID]++
 	}
 	l.leases[id] = reserveLease{authID: a.AuthID}
+	delete(l.rejected, a.AuthID)
 	s.InFlight++
 	s.EstimatedUnobserved = u.charged
 	return s, true
@@ -321,9 +467,7 @@ func handleReserveIntercept(raw []byte) ([]byte, error) {
 		if ok {
 			return okEnvelope(pluginapi.RequestInterceptResponse{})
 		}
-		globalState.RecordLog("warn", "reserve.rejected", "额度保护阻止请求", map[string]any{"auth_id": authID, "reason": s.Reason}, now)
-		body, _ := json.Marshal(map[string]any{"error": map[string]string{"code": "quota_reserve_unavailable", "type": "quota_reserve", "message": s.Reason}})
-		return okEnvelope(pluginapi.RequestInterceptResponse{Terminate: true, StatusCode: http.StatusServiceUnavailable, ResponseBody: body})
+		return rejectReserveIntercept(authID, s.Reason, a.LastSuccessAt, now)
 	}
 	if snap.Config.ReserveStrict && authID != "" {
 		auths, err := (ABIHostClient{}).ListAuths()
@@ -337,11 +481,27 @@ func handleReserveIntercept(raw []byte) ([]byte, error) {
 			}
 		}
 		if codex {
-			body, _ := json.Marshal(map[string]any{"error": map[string]string{"code": "quota_reserve_unavailable", "message": "unknown Codex quota attribution"}})
-			return okEnvelope(pluginapi.RequestInterceptResponse{Terminate: true, StatusCode: http.StatusServiceUnavailable, ResponseBody: body})
+			return rejectReserveIntercept(authID, "reserve_unknown", time.Time{}, now)
 		}
 	}
 	return okEnvelope(pluginapi.RequestInterceptResponse{})
+}
+
+func rejectReserveIntercept(authID, reason string, observed, now time.Time) ([]byte, error) {
+	globalReserveLedger.recordRejection(authID, reason, observed, now)
+	globalState.RecordLog("warn", "reserve.rejected", "额度保护阻止请求", map[string]any{
+		"auth_id": authID, "reason": reason, "request_terminated": true,
+	}, now)
+	publishSchedulerState(globalState, nil, now)
+	body, _ := json.Marshal(map[string]any{"error": map[string]string{
+		"code": "quota_reserve_unavailable", "type": "quota_reserve", "message": reason,
+	}})
+	// CPA v8.0.27 returns an interceptor termination directly to the client.
+	// A subsequent request/pick can fail over; this response cannot reroute it.
+	return okEnvelope(pluginapi.RequestInterceptResponse{
+		Terminate: true, StatusCode: http.StatusServiceUnavailable,
+		ResponseHeaders: http.Header{"Retry-After": {"1"}}, ResponseBody: body,
+	})
 }
 
 func cloneFloat64Ptr(v *float64) *float64 {
@@ -408,17 +568,4 @@ func (c *Config) UnmarshalJSON(raw []byte) error {
 	}
 	*c = cfg
 	return nil
-}
-
-func (l *reserveLedger) selectable(a AccountView) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if a.ReserveMaxInFlight > 0 && l.counts[a.ID] >= a.ReserveMaxInFlight {
-		return false
-	}
-	u := l.used[a.ID]
-	if u.observed.Equal(a.ReserveObservedAt) && u.charged+a.ReserveBudget >= a.ReserveCapacity {
-		return false
-	}
-	return true
 }

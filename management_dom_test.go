@@ -44,3 +44,22 @@ func TestStatusHTMLScriptReferencesResolve(t *testing.T) {
 		t.Fatalf("script references missing from the template: %s", strings.Join(missing, ", "))
 	}
 }
+
+func TestStatusHTMLSyncsSettingsToCPAConfigPanel(t *testing.T) {
+	store := NewPluginState(DefaultConfig())
+	resp := HandleManagementRequest(store, pluginapi.ManagementRequest{Method: http.MethodGet, Path: "/status"}, time.Now())
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("StatusCode = %d; body=%s", resp.StatusCode, resp.Body)
+	}
+	html := string(resp.Body)
+	for _, want := range []string{
+		"requestManagementRoot('/plugins/codex-quota-reserve/config',null,{method:'PATCH'",
+		"savePluginSettings(payload)",
+		"await syncCPASettings(STATUS.settings||{})",
+		"['webhook_url','telegram_chat_id','webhook_configured','telegram_chat_id_configured','enabled','store']",
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("status page missing CPA config sync contract %q", want)
+		}
+	}
+}

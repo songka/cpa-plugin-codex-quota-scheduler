@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	"math"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -170,6 +171,293 @@ func TestReserveConcurrentAdmissionAndUnobservedBudget(t *testing.T) {
 		t.Fatal("a repeated upstream attempt must consume another estimated budget")
 	}
 }
+
+func TestReserveDynamicRejectionMarksAccountAndRecovers(t *testing.T) {
+	previousState := globalState
+	previousLedger := globalReserveLedger
+	previousSnapshot := publishedSchedulerSnapshot.Load()
+	t.Cleanup(func() {
+		globalState = previousState
+		globalReserveLedger = previousLedger
+		publishedSchedulerSnapshot.Store(previousSnapshot)
+	})
+
+	requestResponse := func(t *testing.T, requestID, authID string) pluginapi.RequestInterceptResponse {
+		t.Helper()
+		request := pluginapi.RequestInterceptRequest{
+			RequestID: requestID,
+			ToFormat:  "codex",
+			Metadata:  map[string]any{"selected_auth_id": authID},
+		}
+		requestRaw, err := json.Marshal(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := handleReserveIntercept(requestRaw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var response envelope
+		if err := json.Unmarshal(raw, &response); err != nil {
+			t.Fatal(err)
+		}
+		var result pluginapi.RequestInterceptResponse
+		if err := json.Unmarshal(response.Result, &result); err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+
+	now := time.Now()
+	a, cfg := reserveFixture(now, 50, 50)
+	cfg.ReserveMaxInFlight = 1
+	globalState = NewPluginState(cfg)
+	globalState.UpsertQuota(a)
+	globalReserveLedger = newReserveLedger()
+	if _, ok := globalReserveLedger.admit("first", a, cfg, now); !ok {
+		t.Fatal("first request was not admitted")
+	}
+	if response := requestResponse(t, "second", a.AuthID); !response.Terminate || response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("concurrency response = %+v", response)
+	}
+
+	snapshot := globalState.Snapshot(time.Now())
+	ordered := BuildOrderedAccounts(requestWithCandidates(a.AuthID), snapshot, snapshot.Now)
+	if len(ordered) != 1 || ordered[0].Available || ordered[0].UnavailableReason != "reserve_concurrency" {
+		t.Fatalf("dynamic scheduler status = %#v", ordered)
+	}
+	payload := BuildStatusPayload(snapshot, ordered)
+	if len(payload.Accounts) != 1 || payload.Accounts[0].Available || payload.Accounts[0].UnavailableReason != "reserve_concurrency" || payload.Accounts[0].Reserve.Reason != "reserve_concurrency" {
+		t.Fatalf("dynamic management status = %#v", payload.Accounts)
+	}
+
+	globalReserveLedger.release("first")
+	snapshot = globalState.Snapshot(time.Now())
+	ordered = BuildOrderedAccounts(requestWithCandidates(a.AuthID), snapshot, snapshot.Now)
+	if len(ordered) != 1 || !ordered[0].Available {
+		t.Fatalf("concurrency recovery = %#v", ordered)
+	}
+
+	now = time.Now().Add(-time.Second)
+	a, cfg = reserveFixture(now, 13, 50)
+	cfg.ReserveRequestBudgetPercent = 0.5
+	globalState = NewPluginState(cfg)
+	globalState.UpsertQuota(a)
+	globalReserveLedger = newReserveLedger()
+	if _, ok := globalReserveLedger.admit("budget-first", a, cfg, now); !ok {
+		t.Fatal("budget first request was not admitted")
+	}
+	globalReserveLedger.release("budget-first")
+	if response := requestResponse(t, "budget-second", a.AuthID); !response.Terminate {
+		t.Fatalf("budget response = %+v", response)
+	}
+	snapshot = globalState.Snapshot(time.Now())
+	ordered = BuildOrderedAccounts(requestWithCandidates(a.AuthID), snapshot, snapshot.Now)
+	if len(ordered) != 1 || ordered[0].UnavailableReason != "reserve_budget" {
+		t.Fatalf("budget scheduler status = %#v", ordered)
+	}
+
+	a.LastSuccessAt = time.Now().Add(-time.Millisecond)
+	globalState.UpsertQuota(a)
+	snapshot = globalState.Snapshot(time.Now())
+	ordered = BuildOrderedAccounts(requestWithCandidates(a.AuthID), snapshot, snapshot.Now)
+	if len(ordered) != 1 || !ordered[0].Available {
+		t.Fatalf("budget recovery after fresh observation = %#v", ordered)
+	}
+}
+
+func reserveInterceptForTest(t *testing.T, id, authID string) pluginapi.RequestInterceptResponse {
+	t.Helper()
+	raw, err := json.Marshal(pluginapi.RequestInterceptRequest{
+		RequestID: id, ToFormat: "codex", Metadata: map[string]any{"selected_auth_id": authID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err = handleReserveIntercept(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatal(err)
+	}
+	var response pluginapi.RequestInterceptResponse
+	if err := json.Unmarshal(env.Result, &response); err != nil {
+		t.Fatal(err)
+	}
+	return response
+}
+
+func reserveGlobalsForTest(t *testing.T, cfg Config, accounts ...AccountState) {
+	t.Helper()
+	state, ledger, published := globalState, globalReserveLedger, publishedSchedulerSnapshot.Load()
+	t.Cleanup(func() {
+		globalState, globalReserveLedger = state, ledger
+		publishedSchedulerSnapshot.Store(published)
+	})
+	globalState, globalReserveLedger = NewPluginState(cfg), newReserveLedger()
+	active := make(map[string]struct{}, len(accounts))
+	for _, a := range accounts {
+		active[a.AuthID] = struct{}{}
+	}
+	globalState.ReplaceCPAAdmission(CPAAdmissionState{Observed: true, AuthIDs: active})
+	for _, a := range accounts {
+		globalState.UpsertQuota(a)
+	}
+	publishSchedulerState(globalState, nil, time.Now())
+}
+
+func TestReservePublishedPickSkipsRejectedAccountAndRecoversWithoutPoll(t *testing.T) {
+	now := time.Now()
+	a, cfg := reserveFixture(now, 50, 50)
+	b, _ := reserveFixture(now, 50, 50)
+	b.AuthID = "b"
+	a.Annotation.SchedulerPriority = 10
+	reserveGlobalsForTest(t, cfg, a, b)
+	req := requestWithCandidates("a", "b")
+	if got := schedulerPickPublished(req, now); got.AuthID != "a" {
+		t.Fatalf("initial pick = %+v", got)
+	}
+	admission, version := globalState.CPAAdmissionVersioned()
+	if response := reserveInterceptForTest(t, "first", "a"); response.Terminate {
+		t.Fatalf("first admission = %+v", response)
+	}
+	// A second selection must see the live reservation even before a rejection.
+	if got := schedulerPickPublished(req, time.Now()); got.AuthID != "b" {
+		t.Fatalf("concurrent pick did not skip a: %+v", got)
+	}
+	response := reserveInterceptForTest(t, "raced", "a")
+	if !response.Terminate || response.StatusCode != 503 || response.ResponseHeaders.Get("Retry-After") != "1" {
+		t.Fatalf("race rejection = %+v", response)
+	}
+	published := publishedSchedulerSnapshot.Load()
+	for _, view := range published.Accounts {
+		if view.ID == "a" && (!view.ReserveBlocked || view.ReserveReason != "reserve_concurrency") {
+			t.Fatalf("immediate published marker = %+v", view)
+		}
+	}
+	snapshot := globalState.Snapshot(time.Now())
+	payload := BuildStatusPayload(snapshot, BuildOrderedAccounts(req, snapshot, snapshot.Now))
+	for _, account := range payload.Accounts {
+		if account.AuthID == "a" && (!account.Reserve.Blocked || account.Reserve.Reason != "reserve_concurrency" || account.Reserve.InFlight != 1 || account.Reserve.EstimatedUnobserved <= 0) {
+			t.Fatalf("management rejection marker = %+v", account)
+		}
+	}
+	after, afterVersion := globalState.CPAAdmissionVersioned()
+	if !equalCPAAdmission(admission, after) || version != afterVersion || published.AdmissionVersion != version {
+		t.Fatal("interceptor republish changed admission or mismatched its version")
+	}
+	if got := schedulerPickPublished(req, time.Now()); got.AuthID != "b" {
+		t.Fatalf("next pick after rejection = %+v", got)
+	}
+	globalReserveLedger.release("first")
+	if got := schedulerPickPublished(req, time.Now()); got.AuthID != "a" {
+		t.Fatalf("release did not recover without poll: %+v", got)
+	}
+	if publishedSchedulerSnapshot.Load() != published {
+		t.Fatal("release test unexpectedly republished quota")
+	}
+}
+
+func TestReserveBudgetRemainsBlockedUntilFreshResetObservation(t *testing.T) {
+	now := time.Now().Add(-time.Second)
+	a, cfg := reserveFixture(now, 13, 50)
+	cfg.ReserveRequestBudgetPercent = 0.5
+	b, _ := reserveFixture(now, 50, 50)
+	b.AuthID = "b"
+	a.Annotation.SchedulerPriority = 10
+	reserveGlobalsForTest(t, cfg, a, b)
+	if response := reserveInterceptForTest(t, "charge", "a"); response.Terminate {
+		t.Fatal("first request not admitted")
+	}
+	globalReserveLedger.release("charge")
+	if response := reserveInterceptForTest(t, "blocked", "a"); !response.Terminate {
+		t.Fatal("unobserved budget allowed another request")
+	}
+	later := time.Now().Add(reserveDynamicStatusTTL + time.Second)
+	req := requestWithCandidates("a", "b")
+	if got := schedulerPickPublished(req, later); got.AuthID != "b" {
+		t.Fatalf("budget rejection expired before observation: %+v", got)
+	}
+	if got := schedulerPickPublished(requestWithCandidates("a"), later); !got.Reject || got.DelegateBuiltin != "" {
+		t.Fatalf("strict selection leaked to builtin: %+v", got)
+	}
+	a.LastSuccessAt = time.Now()
+	a.Quota.FiveHour.UsedPercent = reserveFloat(0)
+	a.Quota.FiveHour.ResetAt = a.Quota.FiveHour.ResetAt.Add(time.Hour)
+	globalState.UpsertQuota(a)
+	publishSchedulerState(globalState, nil, time.Now())
+	if got := schedulerPickPublished(req, time.Now()); got.AuthID != "a" {
+		t.Fatalf("fresh active reset did not restore selection: %+v", got)
+	}
+	status := reserveStatusForAccount(a, cfg, time.Now())
+	if status.Blocked || status.EstimatedUnobserved != 0 || status.BudgetSamples != 0 {
+		t.Fatalf("old charges/learning survived reset: %+v", status)
+	}
+}
+
+func TestReserveUnknownInterceptIsVisibleWithoutRosterMutation(t *testing.T) {
+	a, cfg := reserveFixture(time.Now(), 50, 50)
+	reserveGlobalsForTest(t, cfg, a)
+	previousCallback := callHostCallback
+	t.Cleanup(func() { callHostCallback = previousCallback })
+	callHostCallback = func(string, any) (json.RawMessage, error) {
+		return json.RawMessage(`{"files":[{"id":"missing","provider":"codex"}]}`), nil
+	}
+	if response := reserveInterceptForTest(t, "unknown", "missing"); !response.Terminate {
+		t.Fatal("unknown Codex auth not rejected")
+	}
+	snapshot := globalState.Snapshot(time.Now())
+	if len(snapshot.Accounts) != 1 || len(snapshot.CPAAdmission.AuthIDs) != 1 {
+		t.Fatal("interceptor polluted authoritative roster")
+	}
+	payload := buildCurrentStatusPayload(globalState, snapshot.Now)
+	seen := false
+	for _, account := range payload.Accounts {
+		if account.AuthID == "missing" {
+			seen = true
+			if account.Available || account.Reserve.Reason != "reserve_unknown" || !account.FiveHour.Missing {
+				t.Fatalf("unknown account marker = %+v", account)
+			}
+		}
+	}
+	if !seen {
+		t.Fatal("rejected missing account not visible")
+	}
+	payload = buildCurrentStatusPayload(globalState, snapshot.Now.Add(reserveDynamicStatusTTL+time.Second))
+	for _, account := range payload.Accounts {
+		if account.AuthID == "missing" {
+			t.Fatal("transient unknown account did not expire")
+		}
+	}
+}
+
+func TestReserveStaticVerdictAndCredentialReplacement(t *testing.T) {
+	now := time.Now()
+	a, cfg := reserveFixture(now, 10, 50)
+	reserveGlobalsForTest(t, cfg, a)
+	globalReserveLedger.counts["a"] = 1
+	status := reserveStatusForAccount(a, cfg, now)
+	if status.Reason != "reserve_five_hour" {
+		t.Fatalf("dynamic overlay masked quota verdict: %+v", status)
+	}
+	globalReserveLedger = newReserveLedger()
+	a, cfg = reserveFixture(now, 50, 50)
+	if _, ok := globalReserveLedger.admit("old", a, cfg, now); !ok {
+		t.Fatal("old credential admission")
+	}
+	globalReserveLedger.release("old")
+	a.CredentialFingerprint.CompositeHash[0] = 1
+	a.LastSuccessAt = now.Add(-time.Second)
+	if status := reserveStatusForAccount(a, cfg, now); status.Blocked || status.EstimatedUnobserved != 0 {
+		t.Fatalf("replacement credential inherited stale budget: %+v", status)
+	}
+	if status, ok := globalReserveLedger.admit("new", a, cfg, now); !ok {
+		t.Fatalf("admission disagrees with selection after credential replacement: %+v", status)
+	}
+}
+
 func TestReserveHistoryPersistenceRetentionAndDeduplication(t *testing.T) {
 	now := time.Now()
 	a, cfg := reserveFixture(now, 50, 50)

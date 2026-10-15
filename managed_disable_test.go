@@ -36,6 +36,7 @@ func TestManagedQuotaDisableRecordsOwnershipAndWritesHost(t *testing.T) {
 	now := time.Date(2026, 9, 20, 9, 0, 0, 0, time.UTC)
 	cfg := DefaultConfig()
 	cfg.EnableManagedQuotaDisable = true
+	cfg.NotificationsEnabled = true
 	r, host, _ := managedDisableTestRefresher(t, now, cfg)
 
 	if err := r.ApplyManagedQuotaDisable(context.Background(), QuotaFailureEvent{
@@ -57,6 +58,11 @@ func TestManagedQuotaDisableRecordsOwnershipAndWritesHost(t *testing.T) {
 	}
 	if !record.Fingerprint.ValidHashes() {
 		t.Fatal("ownership record missing credential fingerprint")
+	}
+	select {
+	case notification := <-r.state.notifications:
+		t.Fatalf("managed disable sent direct notification %#v; participation tracker should own this transition", notification)
+	default:
 	}
 }
 

@@ -365,7 +365,6 @@ func startReserveMonitor() {
 				notifications := tracker.collect(snap)
 				for _, e := range events {
 					globalState.RecordLog("info", "reserve."+e["event"], "额度预留状态变化", map[string]any{"auth_id": e["auth_id"], "reason": e["reason"]}, now)
-					notifications = append(notifications, notificationForEvent(snap, e["event"], e["auth_id"], e["reason"]))
 				}
 				if report.due(snap.Config.TelemetryPolicy, now) {
 					notifications = append(notifications, notificationForEvent(snap, "usage_report", "", ""))

@@ -39,6 +39,11 @@ const (
 )
 
 type AccountView struct {
+	reserveBase        ReserveStatus
+	reserveProjected   bool
+	reserveFingerprint CredentialFingerprint
+	reserveResetAt     time.Time
+
 	ReserveCapacity    float64
 	ReserveBudget      float64
 	ReserveMaxInFlight int

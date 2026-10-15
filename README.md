@@ -1,10 +1,13 @@
 # Codex Quota Reserve
 
-Independent CPA dynamic plugin `codex-quota-reserve`, targeting **CLIProxyAPI v8.0.27**, based on Jeffery's MIT Codex Quota Scheduler v0.3.2. Release version **0.2.0**, distributed from the existing public repository `songka/cpa-plugin-codex-quota-scheduler`.
+Independent CPA dynamic plugin `codex-quota-reserve`, targeting **CLIProxyAPI v8.0.27**, based on Jeffery's MIT Codex Quota Scheduler v0.3.2. Release version **0.2.1**, distributed from the existing public repository `songka/cpa-plugin-codex-quota-scheduler`.
 
 [中文安装与回滚手册](README.zh-CN.md) · [Upstream documentation](docs/upstream/README.md)
 
-## v0.2.0 Highlights
+## v0.2.1 Highlights
+
+- Quota-cycle reset and history events no longer send Webhook notifications by themselves. Notifications are limited to actual scheduling participation transitions and scheduled usage reports; recovery after an active reset sends one start notification only after fresh quota and CPA admission both confirm participation.
+- Settings saved in the plugin UI are synchronized back to `plugins.configs.codex-quota-reserve` through the CPA management API. `enabled`, `store`, Webhook URLs, Chat IDs and their configured flags are preserved or kept private.
 
 - Optional global and per-account five-hour and weekly/monthly reserve minimums.
 - Stop line = minimum + safety margin; defaults are 10% + 2%. Equality stops allocation.
@@ -26,14 +29,14 @@ Go 1.26+, CGO, GCC and Make are required. Linux glibc is required; these shared 
 make test vet
 # Meaningful reserve concurrency checks:
 go test -race -run '^TestReserve' -count=1 ./...
-make package VERSION=0.2.0
-make checksums VERSION=0.2.0
+make package VERSION=0.2.1
+make checksums VERSION=0.2.1
 bash scripts/test-host-integration.sh
 ```
 
 The integration runner checks out the exact v8.0.27 commit, loads the actual `.so` into the actual host loader and uses simulated OAuth quota responses. It does not send real model requests or modify production CPA. It verifies settings/history/import/export, quota parsing, selection, terminal rejection and after-auth admission. The host's own Manager terminal rejection tests run separately. See [validation and limits](docs/reserve-validation.md) for coverage boundaries.
 
-Native AMD64 and ARM64 GitHub Actions runners produce `codex-quota-reserve_0.2.0_linux_<arch>.zip` and SHA256 files. For cross compilation, set `CC` to an ARM64 C compiler; packaging always runs its Go helper on the native platform.
+Native AMD64 and ARM64 GitHub Actions runners produce `codex-quota-reserve_0.2.1_linux_<arch>.zip` and SHA256 files. For cross compilation, set `CC` to an ARM64 C compiler; packaging always runs its Go helper on the native platform.
 
 ## Configuration
 
@@ -70,7 +73,7 @@ Automatic estimates stay inside the configured bounds (`0 < min <= max <= 10%`) 
 
 Set Webhook URL directly in the plugin's settings and use **Send test notification**. Telegram also needs Chat ID. Saved secrets remain in private plugin user data, so protect its mounted directory and backups. Empty UI fields preserve existing values; use the explicit clear checkbox to remove one. Redacted export/import preserves existing secrets. `RESERVE_WEBHOOK_URL` and `RESERVE_TELEGRAM_CHAT_ID` remain fallbacks when no saved value exists. HTTPS is required except for loopback test receivers.
 
-Enable notifications and scheduled usage reports to send a report every configured number of minutes (default 60, range 1-10080). Participation transitions are deduplicated in memory. A bounded asynchronous worker handles best-effort delivery without delaying quota protection; provider error acknowledgements are treated as failures and redirects are refused. Signed DingTalk endpoints require an external signing gateway; native signature generation is not implemented. No delivery guarantee is claimed.
+Enable notifications and scheduled usage reports to send a report every configured number of minutes (default 60, range 1-10080). Only transitions into or out of scheduling participation and due reports send automatically; quota-window reset/history events remain in history and logs without sending a separate message. Participation transitions are deduplicated in memory, including active-reset recovery. A bounded asynchronous worker handles best-effort delivery without delaying quota protection; provider error acknowledgements are treated as failures and redirects are refused. Signed DingTalk endpoints require an external signing gateway; native signature generation is not implemented. No delivery guarantee is claimed.
 
 With strict reserve enabled, retry targets with an empty provider use a pinned safe Codex account. Set the provider explicitly for Antigravity or other non-Codex fallback targets. Hosts must supply `selected_auth_id` for accurate after-auth attribution. Disable the old scheduler before enabling this one. Do not run two Codex scheduler plugins together.
 
@@ -88,8 +91,8 @@ Set up GitHub Environment `release-approval` with required reviewers. Tags run f
 
 ```sh
 # Approval and passing host/platform tests are prerequisites.
-git tag -a v0.2.0 -m "v0.2.0"
-git push origin v0.2.0
+git tag -a v0.2.1 -m "v0.2.1"
+git push origin v0.2.1
 ```
 
 The repository name is retained; the plugin ID and archive basename remain `codex-quota-reserve`, so the plugin keeps an independent runtime identity.

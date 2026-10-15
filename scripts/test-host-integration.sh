@@ -7,9 +7,11 @@ owned_host=false
 state_dir=$(mktemp -d)
 fixture=
 registry_fixture=
+settings_fixture=
 cleanup() {
   [[ -z "$fixture" ]] || rm -f -- "$fixture"
   [[ -z "$registry_fixture" ]] || rm -f -- "$registry_fixture"
+  [[ -z "$settings_fixture" ]] || rm -f -- "$settings_fixture"
   rm -rf -- "$state_dir"
   if [[ "$owned_host" == true ]]; then rm -rf -- "$host_dir"; fi
 }
@@ -32,3 +34,9 @@ candidate_registry="$host_dir/internal/pluginstore/reserve_registry_external_tes
 registry_fixture=$candidate_registry
 cp "$project_dir/tests/integration/reserve_registry_test.go.txt" "$registry_fixture"
 RESERVE_REGISTRY="$project_dir/registry.json" go -C "$host_dir" test ./internal/pluginstore -run '^TestReserveRegistrySchema$' -count=1
+
+candidate_settings="$host_dir/internal/api/handlers/management/reserve_settings_external_test.go"
+[[ ! -e "$candidate_settings" ]] || { echo 'Refusing to overwrite an existing settings fixture' >&2; exit 1; }
+settings_fixture=$candidate_settings
+cp "$project_dir/tests/integration/reserve_settings_test.go.txt" "$settings_fixture"
+go -C "$host_dir" test ./internal/api/handlers/management -run '^TestReserveSettingsPatchPersists$' -count=1

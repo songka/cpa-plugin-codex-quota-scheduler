@@ -1,10 +1,16 @@
 # Codex Quota Reserve 安装与回滚手册
 
-独立插件 ID：`codex-quota-reserve`。目标宿主：**CLIProxyAPI v8.0.27**。发行版本：**0.2.0**。发布仓库：`songka/cpa-plugin-codex-quota-scheduler`。
+独立插件 ID：`codex-quota-reserve`。目标宿主：**CLIProxyAPI v8.0.27**。发行版本：**0.2.1**。发布仓库：`songka/cpa-plugin-codex-quota-scheduler`。
 
 基于 Jeffery 的 MIT Codex Quota Scheduler v0.3.2 改造。[原版中文说明](docs/upstream/README.zh-CN.md)保留成熟功能的详细说明。
 
-## v0.2.0 主要更新
+## v0.2.1 主要更新
+
+额度周期重置和历史事件不再单独发送 Webhook。自动通知只在账号实际开始／停止参与调度，或定时使用报告到期时发送；主动重置后的恢复只有在新额度和 CPA 重新纳入调度都确认后发送一次“开始参与调度”。
+
+插件页面保存设置后，会通过 CPA 管理 API 同步到 `plugins.configs.codex-quota-reserve` 配置面板。`enabled`、`store`、Webhook 地址、Chat ID 及其已配置标志不会被覆盖或泄露。
+
+每次选账户时实时排除并发或预算受保护的账号，选择其他安全账号；请求被拦截后立即显示具体保护标记，并发占用在请求完成后立即解除。CPA v8.0.27 无法将后置拦截已终止的同一请求重新选路，极少数并发竞态仍返回 503（`Retry-After: 1`），后续请求会重新选择安全账号。
 
 加入全局及单账户 5h、Weekly/Monthly 额度预留，严格拒绝、请求准入、历史曲线和可选通知。最低保留比例与实际调度停止线分别显示；默认最低保留 10%，安全余量 2%，剩余 **≤12%** 即保护。保护默认关闭，开启后默认严格模式和缓存过期保护。
 
@@ -41,7 +47,7 @@ plugins:
       quota_refresh_interval: 5m
 ```
 
-使用现有公开仓库发布；商店安装需要 v0.2.0 Release 中存在对应架构 ZIP 和 `checksums.txt`。开发验收阶段也可将经过 SHA256 检查的对应架构 `.so` 放入挂载的插件目录。文件名必须为 `codex-quota-reserve.so`。插件库地址保持不变，版本由 GitHub 最新正式 Release 自动发现。CPA v8.0.27 缓存最新版本查询一小时，发布后仍显示旧版本时可等缓存过期，或备份后重启 CPA 再刷新插件库。
+使用现有公开仓库发布；商店安装需要 v0.2.1 Release 中存在对应架构 ZIP 和 `checksums.txt`。开发验收阶段也可将经过 SHA256 检查的对应架构 `.so` 放入挂载的插件目录。文件名必须为 `codex-quota-reserve.so`。插件库地址保持不变，版本由 GitHub 最新正式 Release 自动发现。CPA v8.0.27 缓存最新版本查询一小时，发布后仍显示旧版本时可等缓存过期，或备份后重启 CPA 再刷新插件库。
 
 ## 迁移与启用
 
@@ -66,7 +72,7 @@ plugins:
 
 通知默认关闭。在插件“历史与通知”设置中直接填写 Webhook 地址；Telegram 另填 Chat ID。选择企业微信、飞书、钉钉、Telegram 或通用 JSON 格式，点击“发送测试通知”验证接收。已保存地址不回显，留空保留，勾选清除项才删除。地址和 Chat ID 保存在私有插件用户数据中，不包含在设置响应和导出配置里；导入脱敏配置不会清除已有秘密。环境变量 `RESERVE_WEBHOOK_URL`、`RESERVE_TELEGRAM_CHAT_ID` 仅作为没有已保存值时的回退。
 
-开启通知后，账号开始/停止参与调度以及 CPA 停用/恢复都会发送通知。可开启定时使用报告，默认每 60 分钟一次，范围 1-10080 分钟。企业微信和钉钉使用 Markdown，飞书使用卡片，Telegram 使用 HTML；报告显示 5h/长期剩余额度及重置时间、主动重置剩余/累计次数、次数到期时间和额度观测时间。多账号聊天消息按账号分页。
+开启通知后，只有账号开始/停止参与调度，以及到达定时使用报告时间才会发送消息。额度周期重置、进入保护、恢复历史等事件只写入历史和日志，不会因为刷新额度重复报警；主动重置后的恢复在确认重新参与调度后只发送一次开始通知。企业微信和钉钉使用 Markdown，飞书使用卡片，Telegram 使用 HTML；报告显示 5h/长期剩余额度及重置时间、主动重置剩余/累计次数、次数到期时间和额度观测时间。多账号在消息大小允许时合并到一条消息，超出平台限制时才按完整账号分页。
 
 通知由独立工作线程尽力投递，不阻塞额度保护，不承诺必达；拒绝重定向，并检查平台成功回执。地址要求 HTTPS，仅本机回环测试接收器允许 HTTP。带签名的钉钉机器人需外部签名网关；当前不生成签名。保护插件数据目录和备份，不要把 bot token、带密钥的 URL 写入 Git 或聊天。
 
@@ -85,16 +91,16 @@ plugins:
 ```sh
 make test vet
 go test -race -run '^TestReserve' -count=1 ./...
-make package VERSION=0.2.0
-make checksums VERSION=0.2.0
+make package VERSION=0.2.1
+make checksums VERSION=0.2.1
 bash scripts/test-host-integration.sh
 ```
 
 GitHub Actions 在 PR 时执行格式检查、回归、race 检查、真实宿主动态加载集成测试和双架构原生构建。配置带 required reviewers 的 `release-approval` GitHub Environment。测试完成并得到用户批准后才可以：
 
 ```sh
-git tag -a v0.2.0 -m "v0.2.0"
-git push origin v0.2.0
+git tag -a v0.2.1 -m "v0.2.1"
+git push origin v0.2.1
 ```
 
 仓库沿用现有名称；插件 ID、动态库和发行 ZIP 基名仍为 `codex-quota-reserve`，保持独立运行身份。参阅[验证记录和限制](docs/reserve-validation.md)。原 [MIT 许可证](LICENSE)和版权保留；正式再分发前需核对依赖许可证。

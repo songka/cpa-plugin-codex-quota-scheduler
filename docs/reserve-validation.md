@@ -1,6 +1,6 @@
 # Codex Quota Reserve validation and remaining limits
 
-The implementation is prepared for v0.2.0 publication in the existing public repository `songka/cpa-plugin-codex-quota-scheduler`. No production CPA has been changed or enabled by this work.
+The implementation is prepared for v0.2.1 publication in the existing public repository `songka/cpa-plugin-codex-quota-scheduler`. No production CPA has been changed or enabled by this work.
 
 ## Compatibility conclusion
 
@@ -25,6 +25,15 @@ The host skips the calling plugin's request interceptors and lifecycle notificat
 - A network-disabled Docker container ran the actual v8.0.27 dynamic-host integration test binary and actual plugin. A second container process using the same mounted data checked that `.user-data.json` and `quota-history.json` existed and reran the integration checks.
 - Linux AMD64 and ARM64 c-shared builds and ZIP packaging completed, including original license and dependency notices. ZIP SHA256 values and architecture identifiers were checked.
 
+## v0.2.1 release candidate validation (2026-10-15)
+
+- Linux Docker Go 1.26: `go test ./...`, `go vet ./...` and the reserve race suite passed. This verifies the agent build environment, not CLI installation in the user's terminal.
+- Exact CPA v8.0.27 loaded the candidate c-shared plugin and passed the dynamic integration suite, including actual disabled-file updates, manual active-reset recovery, immediate concurrency markers and recovery on completion without a quota poll.
+- New regression tests cover live safe-account failover before rejection, persistent estimated charges until fresh quota evidence, temporary unknown-account markers without authoritative roster mutation, and credential replacement.
+- Headless Edge / Playwright passed the settings PUT followed by host config PATCH, exclusion of private and host-owned fields, partial-sync failure feedback and successful retry. These browser API fixtures do not verify a deployed CPA configuration file.
+- The actual v8.0.27 host config PATCH handler persisted settings under `plugins.configs.codex-quota-reserve`, including false/zero values, while preserving `enabled` and `store` metadata. The browser suite also passed account-editor, history-curve and desktop/mobile overflow checks. No production instance was changed.
+- Windows Git whitespace validation passed with CRLF handled explicitly. Historical packaging results above are not evidence of new v0.2.1 release assets; tag CI must build and verify those assets.
+
 ## Reproduce
 
 ```sh
@@ -34,6 +43,7 @@ bash scripts/test-host-integration.sh
 # Optional Chromium / Playwright smoke check:
 RESERVE_HTML_OUTPUT=/tmp/reserve-ui-render.html go test -run '^TestReserveManagementHTMLControls$' -count=1
 python tests/integration/browser_smoke.py /tmp/reserve-ui-render.html
+node tests/integration/browser_settings_save_test.cjs /tmp/reserve-ui-render.html
 ```
 
 The integration runner uses a temporary host checkout or `CPA_HOST_CHECKOUT`, checks the exact tag SHA, removes only its own temporary fixtures, and injects `XDG_CONFIG_HOME` before starting the test process. Dynamic libraries have their own Go runtime environment view; setting a variable only inside the host's already-running Go test is not a reliable injection mechanism.
@@ -42,7 +52,7 @@ The integration runner uses a temporary host checkout or `CPA_HOST_CHECKOUT`, ch
 
 - Publication uses `songka/cpa-plugin-codex-quota-scheduler`; creating a separate repository is no longer required. The registry and plugin metadata point to this existing repository.
 - Tags run validation and both native platform builds before release. Publication was requested by the user; the release job uses GitHub Environment `release-approval`. Configure required reviewers for future releases if an additional GitHub approval gate is desired.
-- Quota percentages are cached upstream estimates. Neither safety margin nor per-request estimate guarantees an exact remaining percentage. Completion does not refund unobserved consumption, and retries consume another estimate. Simultaneous selection can still race at admission and return a local 503 rather than consume a protected account.
+- Quota percentages are cached upstream estimates. Neither safety margin nor per-request estimate guarantees an exact remaining percentage. Completion does not refund unobserved consumption, and retries consume another estimate. Simultaneous selection can still race at admission; the after-auth interceptor returns a terminal local 503 with `Retry-After: 1` because CPA v8.0.27 exposes no API for an interceptor to select a replacement account. Live concurrency and budget checks exclude unsafe accounts at every scheduler pick, even without a prior rejection. Rejections publish their exact marker immediately. Completion clears concurrency without a quota poll; estimated consumption remains charged until fresh quota evidence arrives, not merely until a timer expires. Missing Codex quota records appear as transient management-only rows without changing the authoritative roster.
 - An empty provider in a strict nested retry is interpreted as Codex. Explicitly name Antigravity or other non-Codex providers in mixed retry chains. Live NewAPI/Antigravity production traffic has not been exercised because production credentials were not supplied.
 - The after-auth guard depends on host credential attribution. Tested host routes provide `selected_auth_id`; a future/new executor path must be integration-tested before relying on it.
 - A disabled/unloaded/fused plugin cannot enforce reserve protection. CPA intentionally falls back when a plugin panics or is fused. Strict protection applies while the plugin is loaded and healthy; do not describe it as a host-wide invariant under plugin failure.

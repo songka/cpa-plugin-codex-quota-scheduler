@@ -25,6 +25,7 @@ type NotificationAccount struct {
 	LongWindowRemaining        *float64      `json:"long_window_remaining_percent,omitempty"`
 	FiveHourReset              time.Time     `json:"five_hour_reset_at"`
 	LongWindowReset            time.Time     `json:"long_window_reset_at"`
+	LongWindowKind             WindowKind    `json:"long_window_kind,omitempty"`
 	ResetCreditsAvailableCount *int          `json:"reset_credits_available_count,omitempty"`
 	ResetCreditsTotalEarned    *int          `json:"reset_credits_total_earned_count,omitempty"`
 	ResetCredits               []ResetCredit `json:"reset_credits,omitempty"`
@@ -39,6 +40,14 @@ type QuotaNotification struct {
 	At       time.Time             `json:"at"`
 	Accounts []NotificationAccount `json:"accounts"`
 }
+
+var notificationZone = time.FixedZone("GMT+8", 8*60*60)
+
+const (
+	notificationProgressWidth = 10
+	notificationMaxResetRows  = 6
+	notificationPayloadLimit  = 4096
+)
 
 func validateNotificationEndpoint(endpoint string) error {
 	if endpoint == "" {
@@ -95,11 +104,22 @@ func accountParticipation(a AccountState, s StateSnapshot) (bool, string) {
 
 func notificationAccount(a AccountState, s StateSnapshot) NotificationAccount {
 	active, reason := accountParticipation(a, s)
+	resetCredits := append([]ResetCredit(nil), a.Quota.ResetCredits...)
+	sort.SliceStable(resetCredits, func(i, j int) bool {
+		left, right := resetCredits[i].ExpiresAt, resetCredits[j].ExpiresAt
+		if left.IsZero() {
+			return false
+		}
+		if right.IsZero() {
+			return true
+		}
+		return left.Before(right)
+	})
 	n := NotificationAccount{
 		AuthID: a.AuthID, Alias: a.Annotation.Alias, Participating: active, Reason: reason, ObservedAt: a.LastSuccessAt,
 		ResetCreditsAvailableCount: cloneIntPtr(a.Quota.ResetCreditsAvailableCount),
 		ResetCreditsTotalEarned:    cloneIntPtr(a.Quota.ResetCreditsTotalEarnedCount),
-		ResetCredits:               append([]ResetCredit(nil), a.Quota.ResetCredits...),
+		ResetCredits:               resetCredits,
 	}
 	for _, w := range []struct {
 		q         *QuotaWindow
@@ -114,16 +134,16 @@ func notificationAccount(a AccountState, s StateSnapshot) NotificationAccount {
 			}
 		}
 	}
+	if a.Quota.LongWindow != nil {
+		n.LongWindowKind = a.Quota.LongWindow.Kind
+	}
 	return n
 }
 
 func notificationForEvent(s StateSnapshot, event, id, reason string) QuotaNotification {
 	titles := map[string]string{
 		"scheduling_started": "账号开始参与调度", "scheduling_stopped": "账号停止参与调度",
-		"cpa_disabled": "CPA 账号已停用", "cpa_enabled": "CPA 账号已恢复启用",
 		"usage_report": "定时额度使用报告", "test": "通知测试",
-		"protection": "额度预留保护", "recovery": "额度保护解除", "reset": "额度周期重置",
-		"low_quota": "账号低额度预警", "refresh_failed": "额度刷新失败", "all_unavailable": "没有可调度账号",
 	}
 	n := QuotaNotification{Plugin: PluginID, Event: event, Title: titles[event], Reason: reason, At: s.Now, Accounts: []NotificationAccount{}}
 	if n.Title == "" {
@@ -139,6 +159,11 @@ func notificationForEvent(s StateSnapshot, event, id, reason string) QuotaNotifi
 }
 
 func (s *PluginState) queueQuotaNotification(n QuotaNotification) {
+	switch n.Event {
+	case "scheduling_started", "scheduling_stopped", "usage_report":
+	default:
+		return
+	}
 	if !s.Config().NotificationsEnabled {
 		return
 	}
@@ -167,7 +192,8 @@ func (s *PluginState) runNotificationDelivery(ctx context.Context) {
 }
 
 type participationTracker struct {
-	previous map[string]NotificationAccount
+	previous    map[string]NotificationAccount
+	initialized bool
 }
 
 func newParticipationTracker() *participationTracker {
@@ -175,14 +201,20 @@ func newParticipationTracker() *participationTracker {
 }
 
 func (t *participationTracker) collect(s StateSnapshot) []QuotaNotification {
+	if !t.initialized && !s.CPAAdmission.Observed {
+		return nil
+	}
 	next := map[string]NotificationAccount{}
-	var events []QuotaNotification
+	changes := map[string][]NotificationAccount{}
 	for _, a := range s.Accounts {
 		if a.Provider != "codex" || a.AuthID == "" {
 			continue
 		}
 		current := notificationAccount(a, s)
 		next[a.AuthID] = current
+		if !t.initialized {
+			continue
+		}
 		previous, known := t.previous[a.AuthID]
 		if (!known && !current.Participating) || (known && previous.Participating == current.Participating) {
 			continue
@@ -191,18 +223,30 @@ func (t *participationTracker) collect(s StateSnapshot) []QuotaNotification {
 		if current.Participating {
 			event = "scheduling_started"
 		}
-		events = append(events, notificationForEvent(s, event, a.AuthID, current.Reason))
+		changes[event] = append(changes[event], current)
 	}
 	for id, previous := range t.previous {
 		if _, exists := next[id]; !exists && previous.Participating {
 			previous.Participating, previous.Reason = false, "account_removed"
-			n := notificationForEvent(s, "scheduling_stopped", id, previous.Reason)
-			n.Accounts = []NotificationAccount{previous}
-			events = append(events, n)
+			changes["scheduling_stopped"] = append(changes["scheduling_stopped"], previous)
 		}
 	}
-	sort.Slice(events, func(i, j int) bool { return events[i].Accounts[0].AuthID < events[j].Accounts[0].AuthID })
+	var events []QuotaNotification
+	for _, event := range []string{"scheduling_stopped", "scheduling_started"} {
+		accounts := changes[event]
+		if len(accounts) == 0 {
+			continue
+		}
+		sort.Slice(accounts, func(i, j int) bool { return accounts[i].AuthID < accounts[j].AuthID })
+		n := notificationForEvent(s, event, "", "")
+		n.Accounts = accounts
+		if len(accounts) == 1 {
+			n.Reason = accounts[0].Reason
+		}
+		events = append(events, n)
+	}
 	t.previous = next
+	t.initialized = true
 	return events
 }
 
@@ -270,14 +314,14 @@ func notificationTime(t time.Time) string {
 	if t.IsZero() {
 		return "未知"
 	}
-	return t.Format("2006-01-02 15:04:05 -07:00")
+	return t.In(notificationZone).Format("2006-01-02 15:04:05 -07:00")
 }
 
 func notificationPercent(v *float64) string {
 	if v == nil {
 		return "未知"
 	}
-	return fmt.Sprintf("%.1f%%", *v)
+	return fmt.Sprintf("%.0f%%", *v)
 }
 
 func notificationCount(v *int) string {
@@ -296,30 +340,177 @@ func notificationLabel(s string) string {
 	return strings.NewReplacer("\\", "\\\\", "*", "\\*", "_", "\\_", "[", "\\[", "]", "\\]", "<", "&lt;", ">", "&gt;", "`", "'").Replace(s)
 }
 
+func notificationReferenceTime(at time.Time) time.Time {
+	if at.IsZero() {
+		return time.Now()
+	}
+	return at
+}
+
+func notificationShortTime(t time.Time) string {
+	if t.IsZero() {
+		return "未知"
+	}
+	return t.In(notificationZone).Format("01/02 15:04")
+}
+
+func notificationRelativeTime(t, at time.Time) string {
+	if t.IsZero() {
+		return "未知"
+	}
+	delta := t.Sub(notificationReferenceTime(at))
+	if delta == 0 {
+		return "刚刚"
+	}
+	future := delta > 0
+	if !future {
+		delta = -delta
+	}
+	var value int64
+	var unit string
+	switch {
+	case delta >= 24*time.Hour:
+		value, unit = int64(delta/(24*time.Hour)), "天"
+	case delta >= time.Hour:
+		value, unit = int64(delta/time.Hour), "小时"
+	case delta >= time.Minute:
+		value, unit = int64(delta/time.Minute), "分钟"
+	default:
+		value, unit = 1, "分钟"
+	}
+	if future {
+		return fmt.Sprintf("%d %s后", value, unit)
+	}
+	return fmt.Sprintf("%d %s前", value, unit)
+}
+
+func notificationExpiryRelativeTime(t, at time.Time) string {
+	if t.IsZero() {
+		return "未知"
+	}
+	if t.Before(notificationReferenceTime(at)) {
+		return "已到期"
+	}
+	return notificationRelativeTime(t, at)
+}
+
+func notificationWindowResetText(resetAt, at time.Time) string {
+	if resetAt.IsZero() {
+		return "重置时间未知"
+	}
+	return fmt.Sprintf("%s · %s", notificationShortTime(resetAt), notificationRelativeTime(resetAt, at))
+}
+
+func notificationResetCreditText(expiresAt, at time.Time) string {
+	if expiresAt.IsZero() {
+		return "未知 · 未知"
+	}
+	return fmt.Sprintf("%s · %s", notificationShortTime(expiresAt), notificationExpiryRelativeTime(expiresAt, at))
+}
+
+func notificationResetCreditsForDisplay(credits []ResetCredit, at time.Time) []ResetCredit {
+	reference := notificationReferenceTime(at)
+	display := make([]ResetCredit, 0, len(credits))
+	for _, credit := range credits {
+		status := strings.ToLower(strings.TrimSpace(credit.Status))
+		if !credit.UsedAt.IsZero() || status == "used" || status == "consumed" || status == "redeemed" {
+			continue
+		}
+		if !credit.ExpiresAt.IsZero() && credit.ExpiresAt.Before(reference) {
+			continue
+		}
+		display = append(display, credit)
+	}
+	sort.SliceStable(display, func(i, j int) bool {
+		left, right := display[i].ExpiresAt, display[j].ExpiresAt
+		if left.IsZero() {
+			return false
+		}
+		if right.IsZero() {
+			return true
+		}
+		return left.Before(right)
+	})
+	return display
+}
+
+func notificationResetCreditCount(a NotificationAccount, available []ResetCredit) string {
+	if a.ResetCreditsAvailableCount != nil {
+		return notificationCount(a.ResetCreditsAvailableCount)
+	}
+	if len(available) > 0 {
+		count := len(available)
+		return fmt.Sprintf("%d 次", count)
+	}
+	return "未知"
+}
+
+func notificationQuotaLabel(a NotificationAccount) string {
+	if a.LongWindowKind == WindowMonthly {
+		return "月限额"
+	}
+	return "周限额"
+}
+
+func notificationProgressBar(v *float64) string {
+	if v == nil || !validPercent(*v) {
+		return strings.Repeat("░", notificationProgressWidth)
+	}
+	percent := *v
+	filled := int(percent/100*notificationProgressWidth + 0.5)
+	if filled < 0 {
+		filled = 0
+	}
+	if filled > notificationProgressWidth {
+		filled = notificationProgressWidth
+	}
+	return strings.Repeat("█", filled) + strings.Repeat("░", notificationProgressWidth-filled)
+}
+
+func notificationAccountName(a NotificationAccount) string {
+	if a.Alias != "" {
+		return a.Alias
+	}
+	return a.AuthID
+}
+
+func notificationResetRows(a NotificationAccount, at time.Time) []ResetCredit {
+	display := notificationResetCreditsForDisplay(a.ResetCredits, at)
+	if len(display) > notificationMaxResetRows {
+		return display[:notificationMaxResetRows]
+	}
+	return display
+}
+
 func notificationMarkdown(n QuotaNotification) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "### %s\n\n%s\n", n.Title, notificationTime(n.At))
+	fmt.Fprintf(&b, "### %s\n", notificationLabel(n.Title))
 	for _, a := range n.Accounts {
-		name := a.Alias
-		if name == "" {
-			name = a.AuthID
-		}
 		state := "停止参与"
 		if a.Participating {
 			state = "参与调度"
 		}
-		fmt.Fprintf(&b, "\n**%s** · %s\n\n", notificationLabel(name), state)
-		fmt.Fprintf(&b, "- 5h 剩余：**%s** · 重置：%s\n", notificationPercent(a.FiveHourRemaining), notificationTime(a.FiveHourReset))
-		fmt.Fprintf(&b, "- 长期剩余：**%s** · 重置/到期：%s\n", notificationPercent(a.LongWindowRemaining), notificationTime(a.LongWindowReset))
-		fmt.Fprintf(&b, "- 主动重置剩余：**%s** · 累计：%s\n", notificationCount(a.ResetCreditsAvailableCount), notificationCount(a.ResetCreditsTotalEarned))
-		for i, credit := range a.ResetCredits {
-			if i >= 3 {
-				fmt.Fprintf(&b, "- 另有 %d 条重置记录\n", len(a.ResetCredits)-i)
-				break
-			}
-			fmt.Fprintf(&b, "- 重置次数到期：%s（%s）\n", notificationTime(credit.ExpiresAt), notificationLabel(credit.Status))
+		fmt.Fprintf(&b, "\n**%s** · %s\n\n", notificationLabel(notificationAccountName(a)), state)
+		fmt.Fprintln(&b, "**主动重置过期时间（GMT+8）**")
+		availableResetCredits := notificationResetCreditsForDisplay(a.ResetCredits, n.At)
+		resetRows := notificationResetRows(a, n.At)
+		for i, credit := range resetRows {
+			fmt.Fprintf(&b, "第 %d 次　%s\n", i+1, notificationResetCreditText(credit.ExpiresAt, n.At))
 		}
-		fmt.Fprintf(&b, "- 状态：%s · 额度观测：%s\n", notificationLabel(a.Reason), notificationTime(a.ObservedAt))
+		if extra := len(availableResetCredits) - len(resetRows); extra > 0 {
+			fmt.Fprintf(&b, "另有 %d 次未展开\n", extra)
+		}
+		fmt.Fprintf(&b, "剩余主动重置：**%s**\n", notificationResetCreditCount(a, availableResetCredits))
+		fmt.Fprintln(&b)
+		fmt.Fprintf(&b, "**5 小时限额**　**%s**\n", notificationPercent(a.FiveHourRemaining))
+		fmt.Fprintf(&b, "`%s`\n", notificationProgressBar(a.FiveHourRemaining))
+		fmt.Fprintf(&b, "%s\n\n", notificationWindowResetText(a.FiveHourReset, n.At))
+		fmt.Fprintf(&b, "**%s**　**%s**\n", notificationQuotaLabel(a), notificationPercent(a.LongWindowRemaining))
+		fmt.Fprintf(&b, "`%s`\n", notificationProgressBar(a.LongWindowRemaining))
+		fmt.Fprintf(&b, "%s\n", notificationWindowResetText(a.LongWindowReset, n.At))
+		if a.ResetCreditsTotalEarned != nil {
+			fmt.Fprintf(&b, "累计主动重置：%s\n", notificationCount(a.ResetCreditsTotalEarned))
+		}
 	}
 	if len(n.Accounts) == 0 {
 		b.WriteString("\n暂无账号额度数据\n")
@@ -336,7 +527,7 @@ func richNotificationBody(p TelemetryPolicy, n QuotaNotification) any {
 		return map[string]any{"msgtype": "markdown", "markdown": map[string]string{"title": n.Title, "text": text}}
 	case "feishu":
 		color := "green"
-		if strings.Contains(n.Event, "stopped") || n.Event == "cpa_disabled" || n.Event == "protection" || n.Event == "low_quota" {
+		if n.Event == "scheduling_stopped" {
 			color = "orange"
 		}
 		return map[string]any{"msg_type": "interactive", "card": map[string]any{
@@ -358,6 +549,49 @@ func notificationBody(kind, text string) any {
 	return richNotificationBody(TelemetryPolicy{NotificationKind: kind}, QuotaNotification{Plugin: PluginID, Title: text})
 }
 
+func notificationPages(p TelemetryPolicy, n QuotaNotification) ([]QuotaNotification, error) {
+	raw, err := json.Marshal(richNotificationBody(p, n))
+	if err != nil {
+		return nil, err
+	}
+	if p.NotificationKind == "generic" || len(raw) <= notificationPayloadLimit {
+		return []QuotaNotification{n}, nil
+	}
+	// Reserve the widest possible page suffix while packing complete accounts.
+	page := n
+	page.Title = fmt.Sprintf("%s (%d/%d)", n.Title, len(n.Accounts), len(n.Accounts))
+	var pages []QuotaNotification
+	start := 0
+	for end := 1; end <= len(n.Accounts); end++ {
+		page.Accounts = n.Accounts[start:end]
+		raw, err = json.Marshal(richNotificationBody(p, page))
+		if err != nil {
+			return nil, err
+		}
+		if len(raw) <= notificationPayloadLimit {
+			continue
+		}
+		if end-start == 1 {
+			return nil, fmt.Errorf("notification account exceeds message size limit")
+		}
+		page.Accounts = n.Accounts[start : end-1]
+		pages = append(pages, page)
+		start = end - 1
+		end--
+	}
+	if start < len(n.Accounts) {
+		page.Accounts = n.Accounts[start:]
+		pages = append(pages, page)
+	}
+	if len(pages) == 0 {
+		return nil, fmt.Errorf("notification exceeds message size limit")
+	}
+	for i := range pages {
+		pages[i].Title = fmt.Sprintf("%s (%d/%d)", n.Title, i+1, len(pages))
+	}
+	return pages, nil
+}
+
 func sendQuotaNotification(ctx context.Context, p TelemetryPolicy, n QuotaNotification) error {
 	endpoint := notificationEndpoint(p)
 	if endpoint == "" {
@@ -369,18 +603,19 @@ func sendQuotaNotification(ctx context.Context, p TelemetryPolicy, n QuotaNotifi
 	if p.NotificationKind == "telegram" && notificationChatID(p) == "" {
 		return fmt.Errorf("Telegram Chat ID 未配置")
 	}
-	// Chat providers enforce small message limits; reports are sent in bounded pages.
-	if len(n.Accounts) > 1 && p.NotificationKind != "generic" {
-		for start := range n.Accounts {
-			page := n
-			page.Accounts = n.Accounts[start : start+1]
-			page.Title = fmt.Sprintf("%s (%d/%d)", n.Title, start+1, len(n.Accounts))
-			if err := sendQuotaNotification(ctx, p, page); err != nil {
-				return err
-			}
-		}
-		return nil
+	pages, err := notificationPages(p, n)
+	if err != nil {
+		return err
 	}
+	for _, page := range pages {
+		if err := sendQuotaNotificationPage(ctx, p, endpoint, page); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func sendQuotaNotificationPage(ctx context.Context, p TelemetryPolicy, endpoint string, n QuotaNotification) error {
 	raw, err := json.Marshal(richNotificationBody(p, n))
 	if err != nil {
 		return err
@@ -432,13 +667,9 @@ func sendQuotaNotification(ctx context.Context, p TelemetryPolicy, n QuotaNotifi
 
 func notificationHTML(n QuotaNotification) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "<b>%s</b>\n%s\n", html.EscapeString(n.Title), notificationTime(n.At))
+	fmt.Fprintf(&b, "<b>%s</b>\n", html.EscapeString(n.Title))
 	for _, a := range n.Accounts {
-		name := a.Alias
-		if name == "" {
-			name = a.AuthID
-		}
-		runes := []rune(strings.ReplaceAll(strings.ReplaceAll(name, "\n", " "), "\r", " "))
+		runes := []rune(strings.ReplaceAll(strings.ReplaceAll(notificationAccountName(a), "\n", " "), "\r", " "))
 		if len(runes) > 80 {
 			runes = runes[:80]
 		}
@@ -447,16 +678,23 @@ func notificationHTML(n QuotaNotification) string {
 			state = "参与调度"
 		}
 		fmt.Fprintf(&b, "\n<b>%s</b> · %s\n", html.EscapeString(string(runes)), state)
-		fmt.Fprintf(&b, "5h 剩余：<b>%s</b>\n重置：%s\n", notificationPercent(a.FiveHourRemaining), notificationTime(a.FiveHourReset))
-		fmt.Fprintf(&b, "长期剩余：<b>%s</b>\n重置/到期：%s\n", notificationPercent(a.LongWindowRemaining), notificationTime(a.LongWindowReset))
-		fmt.Fprintf(&b, "主动重置剩余：<b>%s</b> · 累计：%s\n", notificationCount(a.ResetCreditsAvailableCount), notificationCount(a.ResetCreditsTotalEarned))
-		for i, credit := range a.ResetCredits {
-			if i >= 3 {
-				break
-			}
-			fmt.Fprintf(&b, "重置次数到期：%s\n", notificationTime(credit.ExpiresAt))
+		fmt.Fprintln(&b, "<b>主动重置过期时间（GMT+8）</b>")
+		availableResetCredits := notificationResetCreditsForDisplay(a.ResetCredits, n.At)
+		resetRows := notificationResetRows(a, n.At)
+		for i, credit := range resetRows {
+			fmt.Fprintf(&b, "第 %d 次　%s\n", i+1, html.EscapeString(notificationResetCreditText(credit.ExpiresAt, n.At)))
 		}
-		fmt.Fprintf(&b, "额度观测：%s\n", notificationTime(a.ObservedAt))
+		if extra := len(availableResetCredits) - len(resetRows); extra > 0 {
+			fmt.Fprintf(&b, "另有 %d 次未展开\n", extra)
+		}
+		fmt.Fprintf(&b, "剩余主动重置：<b>%s</b>\n\n", html.EscapeString(notificationResetCreditCount(a, availableResetCredits)))
+		fmt.Fprintf(&b, "<b>5 小时限额</b>　<b>%s</b>\n", html.EscapeString(notificationPercent(a.FiveHourRemaining)))
+		fmt.Fprintf(&b, "<code>%s</code>\n%s\n\n", notificationProgressBar(a.FiveHourRemaining), html.EscapeString(notificationWindowResetText(a.FiveHourReset, n.At)))
+		fmt.Fprintf(&b, "<b>%s</b>　<b>%s</b>\n", notificationQuotaLabel(a), html.EscapeString(notificationPercent(a.LongWindowRemaining)))
+		fmt.Fprintf(&b, "<code>%s</code>\n%s\n", notificationProgressBar(a.LongWindowRemaining), html.EscapeString(notificationWindowResetText(a.LongWindowReset, n.At)))
+		if a.ResetCreditsTotalEarned != nil {
+			fmt.Fprintf(&b, "累计主动重置：%s\n", html.EscapeString(notificationCount(a.ResetCreditsTotalEarned)))
+		}
 	}
 	if len(n.Accounts) == 0 {
 		b.WriteString("\n暂无账号额度数据\n")

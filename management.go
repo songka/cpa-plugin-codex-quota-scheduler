@@ -769,6 +769,20 @@ func buildStatusPayload(snapshot StateSnapshot, ordered []ScheduledAccount, life
 			accountsByAuthID[account.AuthID] = account
 		}
 	}
+	if snapshot.Config.ReserveEnabled && snapshot.Config.ReserveStrict {
+		seen := make(map[string]bool, len(ordered))
+		for _, account := range ordered {
+			seen[account.AuthID] = true
+		}
+		for _, id := range globalReserveLedger.unknownRejections(snapshot.Now) {
+			if _, known := accountsByAuthID[id]; !known && !seen[id] {
+				ordered = append(ordered, ScheduledAccount{
+					AuthID: id, QueueStatus: QueueStatusUnavailable,
+					UnavailableReason: "reserve_unknown",
+				})
+			}
+		}
+	}
 
 	payload := StatusPayload{
 		PluginID:              PluginID,
@@ -794,7 +808,6 @@ func buildStatusPayload(snapshot StateSnapshot, ordered []ScheduledAccount, life
 	} else {
 		payload.RefreshState = "sleeping"
 	}
-	payload.NextAuthID = nextStatusAuthID(ordered)
 	for id, group := range snapshot.Annotations.Groups {
 		payload.Groups = append(payload.Groups, StatusGroup{
 			ID:    id,
@@ -816,8 +829,10 @@ func buildStatusPayload(snapshot StateSnapshot, ordered []ScheduledAccount, life
 			groupNotes = group.Notes
 		}
 
-		reserveStatus := evaluateReserve(account, snapshot.Config, snapshot.Now)
-		reserveStatus.RequestBudget, reserveStatus.BudgetSamples = globalReserveLedger.requestBudget(account, snapshot.Config)
+		if account.AuthID == "" {
+			account.AuthID = scheduled.AuthID
+		}
+		reserveStatus := reserveStatusForAccount(account, snapshot.Config, snapshot.Now)
 		status := StatusAccount{
 			PlanType:          account.Quota.PlanType,
 			Reserve:           reserveStatus,
@@ -843,6 +858,11 @@ func buildStatusPayload(snapshot StateSnapshot, ordered []ScheduledAccount, life
 			AuthFailure:       account.Refresh.AuthFailure,
 			FiveHour:          statusWindow(account.Quota.FiveHour, "5 小时额度"),
 			LongWindow:        statusWindow(account.Quota.LongWindow, longWindowLabelCN(account.Family)),
+		}
+		if reserveStatus.Blocked {
+			status.Available = false
+			status.UnavailableReason = reserveStatus.Reason
+			status.QueueStatus = QueueStatusUnavailable
 		}
 		_, status.RefreshDueReason = accountRefreshDue(account, snapshot.Config, snapshot.Now)
 		status.StatusNote = accountStatusNote(account, status.RefreshDueReason, snapshot, payload.RefreshActive)
@@ -895,6 +915,9 @@ func buildStatusPayload(snapshot StateSnapshot, ordered []ScheduledAccount, life
 			}
 		}
 		payload.Accounts = append(payload.Accounts, status)
+		if payload.NextAuthID == "" && status.Available {
+			payload.NextAuthID = status.AuthID
+		}
 	}
 	if len(payload.Accounts) == 0 {
 		payload.EmptyState = emptyStatePayload(snapshot, payload.RefreshActive)
@@ -1722,6 +1745,7 @@ const TRANSLATIONS={
   }
 };
 Object.assign(TRANSLATIONS.en,{
+  'notice.settingsSyncFailed':'Plugin settings were saved, but syncing to CPA configuration failed: {error}. Save again to retry.',
   'reserve.webhook':'Webhook URL','reserve.clearWebhook':'Clear saved Webhook URL','reserve.clearChat':'Clear saved Chat ID',
   'reserve.report':'Scheduled usage report','reserve.reportMinutes':'Report interval (minutes)','reserve.test':'Send test notification',
   'reserve.disable':'Disable in CPA at the reserve threshold','reserve.autoBudget':'Estimate per-request consumption automatically',
@@ -1729,6 +1753,7 @@ Object.assign(TRANSLATIONS.en,{
   'reserve.configured':'Configured; leave blank to keep','reserve.unconfigured':'Not configured','reserve.sending':'Sending notification...','reserve.sent':'Test notification sent'
 });
 Object.assign(TRANSLATIONS['zh-CN'],{
+  'notice.settingsSyncFailed':'插件设置已保存，但同步到 CPA 配置面板失败：{error}。请再次保存以重试。',
   'reserve.webhook':'Webhook 地址','reserve.clearWebhook':'清除已保存的 Webhook 地址','reserve.clearChat':'清除已保存的 Chat ID',
   'reserve.report':'定时发送使用报告','reserve.reportMinutes':'报告间隔（分钟）','reserve.test':'发送测试通知',
   'reserve.disable':'达到预留线时在 CPA 中停用账号','reserve.autoBudget':'自动估算每请求消耗',
@@ -1809,8 +1834,8 @@ const RETRY_SIZE_RE=/^\d+(\.\d+)?(B|KB|MB|GB|TB|KiB|MiB|GiB|TiB)$/i;
 const RETRY_DURATION_FIELDS=[['retry_stall_timeout','retry.stallTimeout'],['retry_hold_timeout','retry.holdTimeout'],['retry_chain_deadline','retry.chainDeadline']];
 function retryPayloadError(payload){const attempts=Number(payload.retry_max_attempts);if(!Number.isSafeInteger(attempts)||attempts<1||attempts>16)return {key:'retry.error.attempts',field:'retry.maxAttempts',value:payload.retry_max_attempts};const frames=Number(payload.retry_max_frames);if(!Number.isSafeInteger(frames)||frames<1)return {key:'retry.error.frames',field:'retry.maxFrames',value:payload.retry_max_frames};if(!RETRY_SIZE_RE.test(String(payload.retry_max_bytes||'')))return {key:'retry.error.size',field:'retry.maxBytes',value:payload.retry_max_bytes};for(const pair of RETRY_DURATION_FIELDS){if(!RETRY_DURATION_RE.test(String(payload[pair[0]]||'')))return {key:'retry.error.duration',field:pair[1],value:payload[pair[0]]}}if(payload.retry_shadow&&payload.retry_always)return {key:'retry.modes'};if(payload.retry_enabled&&!payload.retry_always){if(!Array.isArray(payload.retry_chain)||payload.retry_chain.length===0)return {key:'retry.invalidRow'};for(const row of payload.retry_chain){if(!row.model||!Array.isArray(row.fallbacks)||row.fallbacks.length===0)return {key:'retry.invalidRow'}}}return null}
 function retryProblemMessage(problem){const label=problem.field?t(problem.field):'';const value=problem.value===undefined||problem.value===null?'':String(problem.value).trim();const detail=[label,value].filter(Boolean).join(': ');return detail?t(problem.key)+' ('+detail+')':t(problem.key)}
-async function saveRetrySettings(){try{if(!statusLoaded){await loadStatus();return}const payload=collectSettingsPayload();const problem=retryPayloadError(payload);if(problem){showNotice(retryProblemMessage(problem),true,problem.key);return}await requestManagement('/settings',{method:'PUT',body:payload});settingsDirty=false;showNotice(t('notice.retrySaved'),false,'notice.retrySaved');await refreshStatus({management:true,fillSettings:true});await refreshRetryStats()}catch(error){showNotice(error.message||String(error),true)}}
-async function requestManagementRoot(path,query){const headers=authHeaders();let url='/v0/management'+path;if(query){const params=new URLSearchParams(query);url+='?'+params.toString()}const resp=await fetch(url,{method:'GET',headers});const data=await readJSON(resp);if(!resp.ok){const message=data.error||data.message||t('error.requestFailed',{status:resp.status});throw new Error(message)}return data}
+async function saveRetrySettings(){try{if(!statusLoaded){await loadStatus();return}const payload=collectSettingsPayload();const problem=retryPayloadError(payload);if(problem){showNotice(retryProblemMessage(problem),true,problem.key);return}await savePluginSettings(payload);showNotice(t('notice.retrySaved'),false,'notice.retrySaved');await refreshStatus({management:true,fillSettings:true});await refreshRetryStats()}catch(error){showNotice(error.message||String(error),true)}}
+async function requestManagementRoot(path,query,options){const opts=options||{};const headers=authHeaders();let url='/v0/management'+path;if(query){const params=new URLSearchParams(query);url+='?'+params.toString()}const init={method:opts.method||'GET',headers};if(Object.prototype.hasOwnProperty.call(opts,'body')){headers['Content-Type']='application/json';init.body=JSON.stringify(opts.body)}const resp=await fetch(url,init);const data=await readJSON(resp);if(!resp.ok){const message=data.error||data.message||t('error.requestFailed',{status:resp.status});if(resp.status===401)showManagementKeyInput();throw new Error(message)}return data}
 async function requestManagementText(path,options){const opts=options||{};const headers=authHeaders();if(opts.contentType)headers['Content-Type']=opts.contentType;const init={method:opts.method||'GET',headers};if(Object.prototype.hasOwnProperty.call(opts,'body'))init.body=String(opts.body);const resp=await fetch('/v0/management'+path,init);const body=await resp.text();if(!resp.ok){let message=body;try{const data=JSON.parse(body);message=data.error||data.message||body}catch(error){}throw new Error(message||t('error.requestFailed',{status:resp.status}))}return body}
 function cpaRetrySettingsCorrect(config){const codex=config&&config.codex||{};const streaming=config&&config.streaming||{};return Number(config&&config['request-retry'])===3&&codex['stream-bootstrap-buffering']===true&&String(codex['stream-bootstrap-timeout']===undefined?'':codex['stream-bootstrap-timeout'])==='0'&&Number(streaming['bootstrap-retries'])===1}
 function yamlTopLevelValue(yaml,key,value){const lines=String(yaml||'').split(/\r?\n/);const prefix=key+':';for(let index=0;index<lines.length;index+=1){const line=lines[index];if(/^\S/.test(line)&&line.trim().startsWith(prefix)){lines[index]=key+': '+value;return lines.join('\n')}}lines.unshift(key+': '+value);return lines.join('\n')}
@@ -1962,7 +1987,10 @@ function fillSettings(){
   document.getElementById('reserveChatState').textContent=t(s.telegram_chat_id_configured?'reserve.configured':'reserve.unconfigured');
   document.getElementById('reserveHistory').checked=s.history_enabled!==false;document.getElementById('reserveHistoryDays').value=s.history_retention_days??30;document.getElementById('reserveNotify').checked=s.notifications_enabled===true;document.getElementById('reserveNotifyKind').value=s.notification_kind??'generic';document.getElementById('reserveWarning').value=s.reserve_warning_percent??20;document.getElementById('reserveEnabled').checked=s.reserve_enabled??false;document.getElementById('reserve5H').value=s.reserve_5h_percent??10;document.getElementById('reserveLong').value=s.reserve_long_percent??10;document.getElementById('reserveStrict').checked=s.reserve_strict??true;document.getElementById('reserveFailClosed').checked=s.reserve_fail_closed??true;document.getElementById('reserveMargin').value=s.reserve_safety_margin_percent??2;document.getElementById('reserveInFlight').value=s.reserve_max_in_flight??1;document.getElementById('reserveBudget').value=s.reserve_request_budget_percent??0.25;document.getElementById('handleEnabled').checked=s.handle_enabled!==false;document.getElementById('usageFeedback').checked=s.enable_usage_feedback!==false;document.getElementById('enableResetProbe').checked=s.enable_reset_probe===true;document.getElementById('probeOnProvisionalRoster').checked=s.probe_on_provisional_roster===true;document.getElementById('monthlyMode').value=s.monthly_mode||'expiry_order';document.getElementById('scheduleAcrossPriorities').checked=s.schedule_across_priorities!==false;document.getElementById('enableManagedQuotaDisable').checked=s.enable_managed_quota_disable===true;document.getElementById('lifecycleEventLimit').value=s.lifecycle_event_limit||50;document.getElementById('refreshInterval').value=s.quota_refresh_interval||'30m0s';document.getElementById('staleAfter').value=s.stale_after||'5h0m0s';document.getElementById('refreshActiveWindow').value=s.refresh_active_window||'1h0m0s';document.getElementById('refreshAfterResetDelay').value=s.refresh_after_reset_delay||'1m0s';document.getElementById('refreshRetryDelays').value=s.refresh_retry_delays||'1m0s,5m0s,15m0s';document.getElementById('authFailureRetryInterval').value=s.auth_failure_retry_interval||'30m0s';document.getElementById('refreshOnStartup').checked=s.refresh_on_startup===true;document.getElementById('maxConcurrency').value=s.max_refresh_concurrency||1;document.getElementById('circuitFailureThreshold').value=s.circuit_failure_threshold||5;document.getElementById('circuitOpenDuration').value=s.circuit_open_duration||'30m0s';document.getElementById('circuitHalfOpenSuccessThreshold').value=s.circuit_half_open_success_threshold||2;document.getElementById('maxLogEntries').value=s.max_log_entries||200;document.getElementById('logRetention').value=s.log_retention||'24h0m0s';fillRetrySettings()
 }
-async function saveSettings(){try{if(!statusLoaded){await loadStatus();return}await requestManagement('/settings',{method:'PUT',body:collectSettingsPayload()});settingsDirty=false;showNotice(t('notice.settingsSaved'),false,'notice.settingsSaved');await refreshStatus({management:true,fillSettings:true})}catch(error){showNotice(error.message||String(error),true)}}
+function publicCPASettings(settings){const config={...settings};for(const key of ['webhook_url','telegram_chat_id','webhook_configured','telegram_chat_id_configured','enabled','store'])delete config[key];return config}
+async function syncCPASettings(settings){try{await requestManagementRoot('/plugins/codex-quota-reserve/config',null,{method:'PATCH',body:publicCPASettings(settings)})}catch(error){throw new Error(t('notice.settingsSyncFailed',{error:error.message||String(error)}))}}
+async function savePluginSettings(payload){const saved=await requestManagement('/settings',{method:'PUT',body:payload});settingsDirty=false;try{await syncCPASettings(saved)}catch(error){await refreshStatus({management:true,fillSettings:true}).catch(()=>{});throw error}return saved}
+async function saveSettings(){try{if(!statusLoaded){await loadStatus();return}await savePluginSettings(collectSettingsPayload());showNotice(t('notice.settingsSaved'),false,'notice.settingsSaved');await refreshStatus({management:true,fillSettings:true})}catch(error){showNotice(error.message||String(error),true)}}
 async function refreshQuota(){try{await requestManagement('/refresh',{method:'POST'});showNotice(t('notice.refreshRequested'),false,'notice.refreshRequested');await refreshStatus({management:true});pollStatus(3,1200)}catch(error){showNotice(error.message||String(error),true)}}
 function splitTags(text){return text.split(',').map((item)=>item.trim()).filter(Boolean)}
 function openEdit(authID){if(!hasManagementKey()){showNotice(t('error.managementKeyRequired'),true,'error.managementKeyRequired');return}const account=accountsByID.get(authID)||{};editingAuthID=authID;document.getElementById('editReserve5H').value=account.reserve_override?.five_hour??'';document.getElementById('editReserveLong').value=account.reserve_override?.long_window??'';document.getElementById('editAuthID').textContent=authID;document.getElementById('editAlias').value=account.alias||'';document.getElementById('editSchedulerPriority').value=account.scheduler_priority||0;document.getElementById('editNotes').value=account.notes||'';document.getElementById('editGroupID').value=account.group_id||'';document.getElementById('editGroupName').value=account.group||'';document.getElementById('editGroupNotes').value=account.group_notes||'';document.getElementById('editTags').value=(account.tags||[]).join(', ');editDialog.showModal()}
@@ -1971,7 +1999,7 @@ async function saveAccountModal(){if(!editingAuthID)return;const groupID=documen
 async function refreshOneQuota(authID){if(!authID)return;try{await requestManagement('/refresh/account',{method:'POST',body:{auth_id:authID}});showNotice(t('notice.refreshOneRequested'),false,'notice.refreshOneRequested');await refreshStatus();pollStatus(3,1200)}catch(error){showNotice(error.message||String(error),true)}}
 async function exportConfig(){try{const data=await requestManagement('/export');const blob=new Blob([JSON.stringify(data,null,2)+'\n'],{type:'application/json'});const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download='codex-quota-reserve-config.json';link.click();URL.revokeObjectURL(link.href);showNotice(t('notice.configExported'),false,'notice.configExported');await refreshLogs()}catch(error){showNotice(error.message||String(error),true)}}
 async function exportLogs(){try{await refreshStatus({management:true});const payload={plugin_id:STATUS.plugin_id||'codex-quota-reserve',exported_at:new Date().toISOString(),logs:STATUS.logs||[]};const blob=new Blob([JSON.stringify(payload,null,2)+'\n'],{type:'application/json'});const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download='codex-quota-reserve-logs.json';link.click();URL.revokeObjectURL(link.href);showNotice(t('notice.logsExported'),false,'notice.logsExported')}catch(error){showNotice(error.message||String(error),true)}}
-async function importConfigFile(file){if(!file)return;try{const text=await file.text();await requestManagement('/import',{method:'POST',body:text});settingsDirty=false;showNotice(t('notice.configImported'),false,'notice.configImported');await refreshStatus({management:true,fillSettings:true})}catch(error){showNotice(error.message||String(error),true)}}
+async function importConfigFile(file){if(!file)return;try{const text=await file.text();await requestManagement('/import',{method:'POST',body:text});settingsDirty=false;await refreshStatus({management:true,fillSettings:true});await syncCPASettings(STATUS.settings||{});showNotice(t('notice.configImported'),false,'notice.configImported')}catch(error){showNotice(error.message||String(error),true)}}
 function formatLogTime(value){if(!value)return'';const date=new Date(value);if(Number.isNaN(date.getTime()))return value;return date.toLocaleString(dateLocale(),{hour12:false})}
 function resetRemainingText(date){const remaining=date.getTime()-Date.now();if(remaining<=0)return currentLocale==='en'?'expired':'已到期';const minute=60000;const hour=60*minute;const day=24*hour;if(remaining<day){if(remaining<hour){const value=Math.max(1,Math.floor(remaining/minute));return currentLocale==='en'?value+' min':value+'分钟'}const value=Math.floor(remaining/hour);return currentLocale==='en'?value+' hr':value+'小时'}const value=Math.floor(remaining/day);return currentLocale==='en'?value+' days':value+'天'}
 function formatQuotaResetLabels(){for(const node of document.querySelectorAll('.quota-reset-label[data-label]')){const label=translateInlineText(node.dataset.label||'额度');node.textContent=currentLocale==='en'?label+' reset: ':label+' 重置：'}}

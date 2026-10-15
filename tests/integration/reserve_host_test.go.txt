@@ -61,7 +61,7 @@ func TestReserveDynamicHostIntegration(t *testing.T) {
  host.ApplyConfig(context.Background(),&cfg)
  deadline:=time.Now().Add(15*time.Second)
  for len(host.RegisteredPlugins())!=1 && time.Now().Before(deadline) {time.Sleep(20*time.Millisecond)}
- if plugins:=host.RegisteredPlugins();len(plugins)!=1 || plugins[0].Metadata.Version!="0.2.0" {t.Fatalf("dynamic loading failed: %+v",plugins)}
+ if plugins:=host.RegisteredPlugins();len(plugins)!=1 || plugins[0].Metadata.Version!="0.2.1" {t.Fatalf("dynamic loading failed: %+v",plugins)}
  host.RegisterManagementRoutes(context.Background(),nil)
  call:=func(method,path string,body []byte) *httptest.ResponseRecorder {t.Helper();rr:=httptest.NewRecorder();req:=httptest.NewRequest(method,"http://host/v0/management/plugins/codex-quota-reserve"+path,bytes.NewReader(body));if !host.ServeManagementHTTP(rr,req) {t.Fatalf("management route absent %s",path)};return rr}
  call("POST","/refresh",nil)
@@ -83,7 +83,16 @@ func TestReserveDynamicHostIntegration(t *testing.T) {
  if !intercept.Terminate || intercept.StatusCode!=503 {t.Fatalf("protected pinned request bypass: %+v",intercept)}
  safe:=host.InterceptRequestAfterAuth(context.Background(),pluginapi.RequestInterceptRequest{RequestID:"safe",ToFormat:"codex",Metadata:map[string]any{"selected_auth_id":"b.json"}});if safe.Terminate {t.Fatalf("safe request rejected: %+v",safe)}
  concurrent:=host.InterceptRequestAfterAuth(context.Background(),pluginapi.RequestInterceptRequest{RequestID:"concurrent",ToFormat:"codex",Metadata:map[string]any{"selected_auth_id":"b.json"}});if !concurrent.Terminate {t.Fatal("concurrency bypass")}
+ if err:=json.Unmarshal(call("GET","/status?format=json",nil).Body.Bytes(),&status);err!=nil {t.Fatal(err)}
+ marked:=false
+ for _,account:=range status.Accounts {if account.AuthID=="b.json" && account.Reserve.Reason=="reserve_concurrency" {marked=true}}
+ if !marked {t.Fatalf("real host rejection missing management marker: %+v",status)}
+ pick,handled,err=host.PickAuth(context.Background(),req)
+ if err!=nil || !handled || !pick.Reject {t.Fatalf("real host reselected concurrency-blocked account: %+v %v",pick,err)}
  host.CompleteRequest(context.Background(),pluginapi.RequestCompletion{RequestID:"safe",Outcome:pluginapi.RequestCompletionSucceeded})
+ completionDeadline:=time.Now().Add(2*time.Second)
+ for time.Now().Before(completionDeadline) {pick,handled,err=host.PickAuth(context.Background(),req);if err==nil && handled && pick.AuthID=="b.json" {break};time.Sleep(10*time.Millisecond)}
+ if err!=nil || !handled || pick.AuthID!="b.json" {t.Fatalf("completion did not restore live selection: %+v %v",pick,err)}
  transport.mu.Lock();transport.used["b"]=90;transport.mu.Unlock();call("POST","/refresh",nil)
  for time.Now().Before(deadline) {pick,handled,err=host.PickAuth(context.Background(),req);if pick.Reject {break};time.Sleep(50*time.Millisecond)}
  if err!=nil || !handled || !pick.Reject || pick.AuthID!="" || pick.DelegateBuiltin!="" || pick.RejectCode!="quota_reserve_unavailable" {t.Fatalf("terminal rejection bypass: %+v handled=%v err=%v",pick,handled,err)}

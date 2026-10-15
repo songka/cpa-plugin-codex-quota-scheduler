@@ -284,8 +284,6 @@ func (r *QuotaRefresher) applyManagedDisable(ctx context.Context, event QuotaFai
 	})
 	if err == nil {
 		r.state.RecordLog("info", "managed.disabled", "已在 CPA 层停用账号", map[string]any{"auth_id": event.AuthID, "auth_index": event.AuthIndex, "reason": event.Reason}, now)
-		snapshot := snapshotWithManagedAccounts(r.state.Snapshot(now), r)
-		r.state.queueQuotaNotification(notificationForEvent(snapshot, "cpa_disabled", event.AuthID, event.Reason))
 		r.wakeRefreshLoop()
 	}
 	return err
@@ -555,13 +553,6 @@ func (r *QuotaRefresher) recoverManagedQuotaAccount(ctx context.Context, authInd
 	})
 	if err == nil {
 		r.state.RecordLog("info", "managed.reenabled", "额度恢复，已自动重新启用账号", map[string]any{"auth_index": authIndex}, r.now())
-		snapshot := r.state.Snapshot(now)
-		if record.Account != nil {
-			account := AccountState{AuthID: record.AuthID, AuthIndex: authIndex, Provider: "codex", Annotation: record.Account.Annotation, Quota: quota, LastSuccessAt: now}
-			n := notificationForEvent(snapshot, "cpa_enabled", record.AuthID, "quota_recovered")
-			n.Accounts = []NotificationAccount{notificationAccount(account, snapshot)}
-			r.state.queueQuotaNotification(n)
-		}
 		r.wakeRefreshLoop()
 	}
 	return err

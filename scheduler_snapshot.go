@@ -75,10 +75,7 @@ func schedulerPickPublished(req pluginapi.SchedulerPickRequest, now time.Time) P
 	local := cloneSchedulerSnapshot(*snapshot)
 	if local.ReserveEnabled {
 		for i, a := range local.Accounts {
-			if !globalReserveLedger.selectable(a) {
-				local.Accounts[i].ReserveBlocked = true
-				local.Accounts[i].ReserveReason = "reserve_concurrency_or_budget"
-			}
+			applyReserveStatus(&local.Accounts[i], globalReserveLedger.statusForView(a, now))
 		}
 	}
 	snapshot = &local
@@ -184,7 +181,7 @@ func schedulerSnapshotFromState(state StateSnapshot, trials *TrialRegistry) *Sch
 		activity = pump.enqueue
 		observation = pump.enqueueObservation
 	}
-	return &SchedulerSnapshot{ReserveEnabled: state.Config.ReserveEnabled, ReserveStrict: state.Config.ReserveStrict, HandleEnabled: state.Config.HandleEnabled, Fallback: state.Config.Fallback, MonthlyMode: state.Config.MonthlyMode, Accounts: accounts, ActiveHighestTier: active, Trials: trials, EvidenceIntents: globalEvidenceIntents, Activity: activity, Observation: observation}
+	return &SchedulerSnapshot{ReserveEnabled: state.Config.ReserveEnabled, ReserveStrict: state.Config.ReserveStrict, HandleEnabled: state.Config.HandleEnabled, Fallback: state.Config.Fallback, MonthlyMode: state.Config.MonthlyMode, Accounts: accounts, ActiveHighestTier: active, Trials: trials, EvidenceIntents: globalEvidenceIntents, AdmissionVersion: state.CPAAdmissionVersion, Activity: activity, Observation: observation}
 }
 
 func accountViewFromState(a AccountState, cfg Config, now time.Time, trials *TrialRegistry) AccountView {
@@ -208,24 +205,7 @@ func accountViewFromState(a AccountState, cfg Config, now time.Time, trials *Tri
 	} else if circuit == CircuitStateHalfOpen {
 		circuitClass = CircuitHalfOpen
 	}
-	reserve := evaluateReserve(a, cfg, now)
-	capacity := 100.0
-	if cfg.ReserveEnabled {
-		for _, w := range []struct {
-			q    *QuotaWindow
-			line float64
-		}{{a.Quota.FiveHour, reserve.FiveHourStopLine}, {a.Quota.LongWindow, reserve.LongStopLine}} {
-			if w.q != nil && w.q.UsedPercent != nil {
-				distance := 100 - *w.q.UsedPercent - w.line
-				if distance < capacity {
-					capacity = distance
-				}
-			}
-		}
-	}
-	return AccountView{
-		ReserveCapacity: capacity, ReserveBudget: requestBudgetForView(a, cfg), ReserveMaxInFlight: cfg.ReserveMaxInFlight, ReserveObservedAt: a.LastSuccessAt,
-		ReserveBlocked: reserve.Blocked, ReserveReason: reserve.Reason, ReserveValidUntil: reserve.ValidUntil, ReserveFailClosed: cfg.ReserveEnabled && cfg.ReserveFailClosed,
+	view := AccountView{
 		ID: a.AuthID, AuthIndex: a.AuthIndex, Instance: a.Instance,
 		PluginPriority: a.Annotation.SchedulerPriority, CPAPriority: a.Priority, Family: a.Family,
 		Cache: cache, LastKnownAvailable: a.LastError == "", Exhausted: exhausted,
@@ -233,6 +213,9 @@ func accountViewFromState(a AccountState, cfg Config, now time.Time, trials *Tri
 		TemporaryUnavailable: a.TemporaryExhausted && a.TemporaryResetAt.After(now),
 		Trial:                trial, Expiry: accountSortTime(a), RemainingQuota: remainingQuota(a), QuotaPressure: quotaPressure(a, now),
 	}
+	populateReserveView(&view, a, cfg, now)
+	applyReserveStatus(&view, globalReserveLedger.statusForView(view, now))
+	return view
 }
 
 func publishSchedulerState(state *PluginState, active map[string]struct{}, now time.Time) {
@@ -244,7 +227,6 @@ func publishSchedulerState(state *PluginState, active map[string]struct{}, now t
 		s.CPAAdmission = CPAAdmissionState{Observed: true, AuthIDs: cloneStringSet(active)}
 	}
 	snapshot := schedulerSnapshotFromState(s, globalTrials)
-	_, snapshot.AdmissionVersion = state.CPAAdmissionVersioned()
 	PublishSchedulerSnapshot(snapshot)
 }
 func accountExhaustion(a AccountState, now time.Time) (bool, time.Time) {
