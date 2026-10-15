@@ -107,7 +107,7 @@ config.go          按基础配置解码；刷新间隔警告；版本 0.2.2
 management.go      configuration_warning；上游冷却显示文案
 ```
 
-发布计划：使用现有 GitHub Actions 的 `release-approval` 流程发布 v0.2.2，保留原插件库 URL，不绕过宿主或仓库的保护规则。公开 Release 和远程安装验证以发布后的实际结果为准。
+发布结果：已使用现有 GitHub Actions 的 `release-approval` 流程发布 v0.2.2，未绕过宿主或仓库保护规则。`main` 和 `v0.2.2` 已推送；公开 Release 为非草稿、非预发布，包含 AMD64/ARM64 ZIP、各自 SHA256 文件和 `checksums.txt`。raw registry URL 返回 HTTP 200，内容仍正确登记 `codex-quota-reserve`；版本发现由 CPA 查询该仓库最新正式 Release 完成，宿主已有一小时缓存窗口。
 
 核心差异：配置合并/保存；账号短期冷却及选号过滤；最后一次执行前拒绝的预算回滚；警告展示；专项回归及版本元数据。工作区原有大量 CRLF 差异和 `.serena/` 不属于本次功能修改，不会整批提交或回滚。
 
