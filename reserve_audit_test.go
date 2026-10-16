@@ -38,7 +38,7 @@ func reserveAuditAccount(t *testing.T, id string, now time.Time) AccountState {
 }
 
 func TestReserveAuditRetryFailoverMarksAndSkipsAccount(t *testing.T) {
-	for _, status := range []int{503, 429, 529} {
+	for _, status := range []int{429} {
 		t.Run(strconv.Itoa(status), func(t *testing.T) {
 			reserveAuditGlobals(t)
 			now := time.Now()
@@ -91,6 +91,46 @@ func TestReserveAuditRetryFailoverMarksAndSkipsAccount(t *testing.T) {
 	}
 }
 
+func TestReserveAuditRetryFailoverDoesNotCoolAccountForSharedOverload(t *testing.T) {
+	for _, status := range []int{500, 502, 503, 504, 529} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			reserveAuditGlobals(t)
+			now := time.Now()
+			a, cfg := reserveFixture(now, 50, 50)
+			b := a
+			b.AuthID = "b"
+			cfg.RetryEnabled, cfg.RetryAlways = true, true
+			currentConfig.Store(cfg)
+			globalState = NewPluginState(cfg)
+			globalState.UpsertQuota(a)
+			globalState.UpsertQuota(b)
+			globalState.ReplaceCPAAdmission(CPAAdmissionState{Observed: true, AuthIDs: map[string]struct{}{"a": {}, "b": {}}})
+			callHostCallback = func(string, any) (json.RawMessage, error) {
+				return json.RawMessage(`{"files":[{"id":"a","provider":"codex","auth_index":"idx-a"},{"id":"b","provider":"codex","auth_index":"idx-b"}]}`), nil
+			}
+			host := installFakeRetryHost(t)
+			host.push(fakeRetryAttempt{status: status})
+			host.push(fakeRetryAttempt{chunks: retryFrames(retryDeltaFrame, retryDoneFrame)})
+			runRetryChain(context.Background(), retryTestRequest("model"), "plugin-stream")
+			requests, _, closeErr, closed := host.snapshot()
+			if len(requests) != 2 || requests[0].AuthID != "a" || requests[1].AuthID != "b" || !closed || closeErr != "" {
+				t.Fatalf("failover: requests=%+v closed=%v error=%q", requests, closed, closeErr)
+			}
+			failed := reserveAuditAccount(t, "a", now)
+			if !failed.UpstreamCooldownUntil.IsZero() {
+				t.Fatalf("shared overload incorrectly cooled account: %+v", failed)
+			}
+			req := pluginapi.SchedulerPickRequest{Provider: "codex", Candidates: []pluginapi.SchedulerAuthCandidate{
+				{ID: "a", Provider: "codex"}, {ID: "b", Provider: "codex"},
+			}}
+			ordered := BuildOrderedAccounts(req, globalState.Snapshot(time.Now()), time.Now())
+			if len(ordered) == 0 || ordered[0].AuthID != "a" {
+				t.Fatalf("overload should not permanently skip account: %+v", ordered)
+			}
+		})
+	}
+}
+
 func TestReserveAuditHeldStreamFailureMarksAccount(t *testing.T) {
 	reserveAuditGlobals(t)
 	now := time.Now()
@@ -101,7 +141,10 @@ func TestReserveAuditHeldStreamFailureMarksAccount(t *testing.T) {
 		return json.RawMessage(`{"files":[{"id":"a","provider":"codex","auth_index":"idx-a"}]}`), nil
 	}
 	host := installFakeRetryHost(t)
-	host.push(fakeRetryAttempt{chunks: retryFrames(retryCapacityFrame)})
+	host.push(fakeRetryAttempt{chunks: retryFrames(`event: error
+data: {"error":{"type":"rate_limit_error"}}
+
+`)})
 	result := runRetryAttempt(context.Background(), cfg, retryTestRequest("model").ExecutorRequest, "", retryAttemptState{}, protocolCodex, "plugin-stream", now.Add(time.Minute))
 	if !result.retryable || !reserveAuditAccount(t, "a", now).UpstreamCooldownUntil.After(now) {
 		t.Fatalf("held stream failure was not attributed: %+v", result)
@@ -123,7 +166,7 @@ func TestReserveAuditNestedAdmissionSkipsSaturatedAccount(t *testing.T) {
 	if _, ok := globalReserveLedger.admit("busy", a, cfg, now); !ok {
 		t.Fatal("setup admission failed")
 	}
-	auth, lease, err := reserveNestedAdmit(cfg, "codex")
+	auth, lease, err := reserveNestedAdmit(cfg, "codex", nil)
 	if err != nil || auth != "b" {
 		t.Fatalf("saturated A did not switch to B: %q, %v", auth, err)
 	}
@@ -143,7 +186,9 @@ func TestReserveAuditUsageCooldownDoesNotInventLocalFailure(t *testing.T) {
 	if !reserveAuditAccount(t, "a", now).UpstreamCooldownUntil.IsZero() {
 		t.Fatal("local admission rejection was treated as upstream overload")
 	}
-	local.AuthID, local.AuthIndex, local.Failure.Body = "", "idx-a", "service unavailable"
+	local.AuthID, local.AuthIndex = "", "idx-a"
+	local.Failure.StatusCode = 429
+	local.Failure.Body = `{"error":{"type":"rate_limit_error"}}`
 	HandleUsageFeedback(globalState, local, now)
 	if !reserveAuditAccount(t, "a", now).UpstreamCooldownUntil.After(now) {
 		t.Fatal("usage failure by auth index was not marked")

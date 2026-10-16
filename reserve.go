@@ -539,7 +539,7 @@ var nestedReserveSequence atomic.Uint64
 // Host nested execution skips the calling plugin's interceptors. Explicitly
 // reserve and pin a safe Codex auth before invoking it, retaining the lease for
 // the entire nested stream. Non-Codex targets keep their original route.
-func reserveNestedAdmit(cfg Config, provider string) (authID, leaseID string, err error) {
+func reserveNestedAdmit(cfg Config, provider string, skipAuths map[string]struct{}) (authID, leaseID string, err error) {
 	if !cfg.ReserveEnabled || !cfg.ReserveStrict || (provider != "" && provider != "codex") {
 		return "", "", nil
 	}
@@ -561,6 +561,9 @@ func reserveNestedAdmit(cfg Config, provider string) (authID, leaseID string, er
 	}
 	leaseID = fmt.Sprintf("nested-reserve-%d", nestedReserveSequence.Add(1))
 	for _, candidate := range BuildOrderedAccounts(req, snap, now) {
+		if _, skip := skipAuths[candidate.AuthID]; skip {
+			continue
+		}
 		if !candidate.Available {
 			continue
 		}

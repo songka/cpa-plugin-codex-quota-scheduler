@@ -196,6 +196,7 @@ func runRetryChain(ctx context.Context, req rpcExecutorRequest, streamID string)
 	var lastReason string
 	var lastKind retryFailureKind
 	var lastAttempt attemptResult
+	skipAuths := make(map[string]struct{})
 
 	for index := 0; index < attempts; index++ {
 		target, okTarget := plan.Target(index)
@@ -207,7 +208,7 @@ func runRetryChain(ctx context.Context, req rpcExecutorRequest, streamID string)
 			lastReason = "retry chain deadline exceeded before the next attempt"
 			break
 		}
-		state := retryAttemptState{index: index, target: target, requested: plan.Requested}
+		state := retryAttemptState{index: index, target: target, requested: plan.Requested, skipAuths: skipAuths}
 		globalRetryStats.attemptStarted(requested, index, FormatRetryTarget(target))
 		recordRetryLog("info", "retry.attempt_started", "重试链开始尝试", map[string]any{
 			"requested_model": requested,
@@ -230,6 +231,9 @@ func runRetryChain(ctx context.Context, req rpcExecutorRequest, streamID string)
 			lastReason = result.reason
 			lastKind = result.kind
 			lastAttempt = result
+			if result.authID != "" {
+				skipAuths[result.authID] = struct{}{}
+			}
 			globalRetryStats.retryScheduled(requested, index, FormatRetryTarget(target), string(result.kind), result.reason)
 			recordRetryLog("warn", "retry.retry_scheduled", "上游可重试失败，切换到下一个目标", map[string]any{
 				"requested_model": requested,
@@ -362,6 +366,7 @@ type retryAttemptState struct {
 	index     int
 	target    RetryTarget
 	requested RetryTarget
+	skipAuths map[string]struct{}
 }
 
 type attemptResult struct {
@@ -390,6 +395,9 @@ func runRetryAttempt(ctx context.Context, cfg Config, exec pluginapi.ExecutorReq
 	}
 	nestedOpen := true
 	defer func() {
+		if out.authID == "" {
+			out.authID = result.authID
+		}
 		recordNestedFailureCooldown(result.authID, out)
 		if nestedOpen {
 			closeNestedStream(nestedID)
@@ -488,12 +496,13 @@ func runRetryAttempt(ctx context.Context, cfg Config, exec pluginapi.ExecutorReq
 
 // openNestedStream issues one nested execution through the host.
 func openNestedStream(cfg Config, exec pluginapi.ExecutorRequest, hostCallbackID string, state retryAttemptState, protocol string) (stream string, out attemptResult, ready bool) {
-	authID, leaseID, admitErr := reserveNestedAdmit(cfg, state.target.Provider)
+	authID, leaseID, admitErr := reserveNestedAdmit(cfg, state.target.Provider, state.skipAuths)
 	if admitErr != nil {
 		return "", attemptResult{reason: admitErr.Error()}, false
 	}
 	leaseTransferred := false
 	defer func() {
+		out.authID = authID
 		recordNestedFailureCooldown(authID, out)
 		if !leaseTransferred && leaseID != "" {
 			globalReserveLedger.release(leaseID)
@@ -558,6 +567,21 @@ func recordNestedFailureCooldown(authID string, result attemptResult) {
 		return
 	}
 	now := time.Now()
+	if result.kind == retryKindOverload || result.kind == retryKindCapacity {
+		// Server/model overload and model capacity are shared provider
+		// conditions, not account defects. Keep the retry chain moving without
+		// making the account look unavailable to the next request.
+		resetHostCooldownAfterOverload(globalState, pluginapi.UsageRecord{
+			Provider: "codex",
+			AuthID:   authID,
+			Failed:   true,
+			Failure: pluginapi.UsageFailure{
+				StatusCode: result.status,
+				Body:       result.reason,
+			},
+		}, now)
+		return
+	}
 	if globalState.RecordUpstreamCooldown(authID, "", "upstream_cooldown", now) {
 		globalState.RecordLog("warn", "upstream.cooldown", "上游临时失败，账号短期冷却", map[string]any{
 			"auth_id": authID, "status_code": result.status, "kind": result.kind,

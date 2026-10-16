@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
@@ -427,5 +429,152 @@ func TestUsageFeedbackSuccessClearsTemporaryExhausted(t *testing.T) {
 	}
 	if !clearedSeen {
 		t.Fatal("circuit.success log missing temporary_exhausted_cleared field")
+	}
+}
+
+func TestUsageOverloadResetsHostCooldownWithoutPluginAccountCooldown(t *testing.T) {
+	previousCallback := callHostCallback
+	t.Cleanup(func() { callHostCallback = previousCallback })
+
+	now := time.Date(2026, 10, 15, 9, 0, 0, 0, time.UTC)
+	store := NewPluginState(DefaultConfig())
+	store.UpsertQuota(AccountState{AuthID: "auth-1", AuthIndex: "idx-1", Provider: "codex"})
+
+	var methods []string
+	var resetRequest pluginapi.HostRoutingResetCooldownRequest
+	callHostCallback = func(method string, payload any) (json.RawMessage, error) {
+		methods = append(methods, method)
+		if method == pluginabi.MethodHostRoutingResetCooldown {
+			resetRequest = payload.(pluginapi.HostRoutingResetCooldownRequest)
+		}
+		return json.RawMessage(`{}`), nil
+	}
+
+	HandleUsageFeedback(store, pluginapi.UsageRecord{
+		Provider:  "codex",
+		AuthID:    "auth-1",
+		AuthIndex: "idx-1",
+		Failed:    true,
+		Failure: pluginapi.UsageFailure{
+			StatusCode: 503,
+			Body:       `{"error":{"type":"service_unavailable_error","code":"server_is_overloaded"}}`,
+		},
+	}, now)
+
+	if len(methods) != 1 || methods[0] != pluginabi.MethodHostRoutingResetCooldown {
+		t.Fatalf("host callbacks = %#v, want one reset_cooldown call", methods)
+	}
+	if resetRequest.AuthIndex != "idx-1" {
+		t.Fatalf("reset request = %#v", resetRequest)
+	}
+	account := accountByAuthID(t, store.Snapshot(now), "auth-1")
+	if !account.UpstreamCooldownUntil.IsZero() {
+		t.Fatalf("plugin cooldown = %s, want no account cooldown for shared overload", account.UpstreamCooldownUntil)
+	}
+	if account.TemporaryExhausted {
+		t.Fatalf("overload incorrectly marked account quota exhausted: %#v", account)
+	}
+}
+
+func TestUsageOverloadDoesNotResetConfirmedQuotaCooldown(t *testing.T) {
+	previousCallback := callHostCallback
+	t.Cleanup(func() { callHostCallback = previousCallback })
+
+	now := time.Date(2026, 10, 15, 9, 0, 0, 0, time.UTC)
+	store := NewPluginState(DefaultConfig())
+	store.UpsertQuota(AccountState{AuthID: "auth-1", AuthIndex: "idx-1", Provider: "codex"})
+	store.MarkAccountTemporaryExhausted("auth-1", now.Add(time.Hour), usageLimitReachedReason)
+
+	var resetCalls int
+	callHostCallback = func(method string, payload any) (json.RawMessage, error) {
+		if method == pluginabi.MethodHostRoutingResetCooldown {
+			resetCalls++
+		}
+		return json.RawMessage(`{}`), nil
+	}
+
+	HandleUsageFeedback(store, pluginapi.UsageRecord{
+		Provider:  "codex",
+		AuthID:    "auth-1",
+		AuthIndex: "idx-1",
+		Failed:    true,
+		Failure: pluginapi.UsageFailure{
+			StatusCode: 503,
+			Body:       `{"error":{"type":"service_unavailable_error","code":"server_is_overloaded"}}`,
+		},
+	}, now)
+
+	if resetCalls != 0 {
+		t.Fatalf("host reset calls = %d, want 0 for quota-protected account", resetCalls)
+	}
+	if account := accountByAuthID(t, store.Snapshot(now), "auth-1"); !account.TemporaryExhausted {
+		t.Fatal("confirmed quota exhaustion was cleared by overload recovery")
+	}
+}
+
+func TestUsageReserveAdmissionFailureDoesNotResetHostCooldown(t *testing.T) {
+	previousCallback := callHostCallback
+	t.Cleanup(func() { callHostCallback = previousCallback })
+
+	now := time.Date(2026, 10, 15, 9, 0, 0, 0, time.UTC)
+	store := NewPluginState(DefaultConfig())
+	store.UpsertQuota(AccountState{AuthID: "auth-1", AuthIndex: "idx-1", Provider: "codex"})
+
+	var resetCalls int
+	callHostCallback = func(method string, payload any) (json.RawMessage, error) {
+		if method == pluginabi.MethodHostRoutingResetCooldown {
+			resetCalls++
+		}
+		return json.RawMessage(`{}`), nil
+	}
+
+	HandleUsageFeedback(store, pluginapi.UsageRecord{
+		Provider:  "codex",
+		AuthID:    "auth-1",
+		AuthIndex: "idx-1",
+		Failed:    true,
+		Failure: pluginapi.UsageFailure{
+			StatusCode: 503,
+			Body:       `{"error":{"code":"quota_reserve_unavailable"}}`,
+		},
+	}, now)
+
+	if resetCalls != 0 {
+		t.Fatalf("host reset calls = %d, want 0 for local reserve rejection", resetCalls)
+	}
+}
+
+func TestUsageModelCapacityDoesNotCoolAccount(t *testing.T) {
+	previousCallback := callHostCallback
+	t.Cleanup(func() { callHostCallback = previousCallback })
+
+	now := time.Date(2026, 10, 16, 9, 0, 0, 0, time.UTC)
+	store := NewPluginState(DefaultConfig())
+	store.UpsertQuota(AccountState{AuthID: "auth-1", AuthIndex: "idx-1", Provider: "codex"})
+
+	var resetCalls int
+	callHostCallback = func(method string, payload any) (json.RawMessage, error) {
+		if method == pluginabi.MethodHostRoutingResetCooldown {
+			resetCalls++
+		}
+		return json.RawMessage(`{}`), nil
+	}
+
+	HandleUsageFeedback(store, pluginapi.UsageRecord{
+		Provider:  "codex",
+		AuthID:    "auth-1",
+		AuthIndex: "idx-1",
+		Failed:    true,
+		Failure: pluginapi.UsageFailure{
+			Body: `{"error":{"message":"Selected model is at capacity. Please try a different model."}}`,
+		},
+	}, now)
+
+	account := accountByAuthID(t, store.Snapshot(now), "auth-1")
+	if !account.UpstreamCooldownUntil.IsZero() {
+		t.Fatalf("model capacity incorrectly cooled account: %s", account.UpstreamCooldownUntil)
+	}
+	if resetCalls != 1 {
+		t.Fatalf("host reset calls = %d, want one capacity recovery", resetCalls)
 	}
 }

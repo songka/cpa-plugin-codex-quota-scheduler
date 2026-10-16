@@ -1,8 +1,13 @@
 # Codex Quota Reserve
 
-Independent CPA dynamic plugin `codex-quota-reserve`, targeting **CLIProxyAPI v8.0.27**, based on Jeffery's MIT Codex Quota Scheduler v0.3.2. Release version **0.2.2**, distributed from the existing public repository `songka/cpa-plugin-codex-quota-scheduler`.
+Independent CPA dynamic plugin `codex-quota-reserve`, targeting **CLIProxyAPI v8.0.27**, based on Jeffery's MIT Codex Quota Scheduler v0.3.2. Release version **0.2.3**, distributed from the existing public repository `songka/cpa-plugin-codex-quota-scheduler`.
 
 [中文安装与回滚手册](README.zh-CN.md) · [Upstream documentation](docs/upstream/README.md)
+
+## v0.2.3 Highlights
+
+- Shared model capacity and upstream overload failures retry or fail over without leaving an account-level cooldown. Real 429 rate limits still mark and cool the attributed account.
+- Nested retry attempts exclude the failed account for the current request, while overload and capacity recovery leave that account eligible for the next request.
 
 ## v0.2.2 Highlights
 
@@ -37,14 +42,14 @@ Go 1.26+, CGO, GCC and Make are required. Linux glibc is required; these shared 
 make test vet
 # Meaningful reserve concurrency checks:
 go test -race -run '^TestReserve' -count=1 ./...
-make package VERSION=0.2.2
-make checksums VERSION=0.2.2
+make package VERSION=0.2.3
+make checksums VERSION=0.2.3
 bash scripts/test-host-integration.sh
 ```
 
 The integration runner checks out the exact v8.0.27 commit, loads the actual `.so` into the actual host loader and uses simulated OAuth quota responses. It does not send real model requests or modify production CPA. It verifies settings/history/import/export, quota parsing, selection, terminal rejection and after-auth admission. The host's own Manager terminal rejection tests run separately. See [validation and limits](docs/reserve-validation.md) for coverage boundaries.
 
-Native AMD64 and ARM64 GitHub Actions runners produce `codex-quota-reserve_0.2.2_linux_<arch>.zip` and SHA256 files. For cross compilation, set `CC` to an ARM64 C compiler; packaging always runs its Go helper on the native platform.
+Native AMD64 and ARM64 GitHub Actions runners produce `codex-quota-reserve_0.2.3_linux_<arch>.zip` and SHA256 files. For cross compilation, set `CC` to an ARM64 C compiler; packaging always runs its Go helper on the native platform.
 
 ## Configuration
 
@@ -99,8 +104,8 @@ Set up GitHub Environment `release-approval` with required reviewers. Tags run f
 
 ```sh
 # Approval and passing host/platform tests are prerequisites.
-git tag -a v0.2.2 -m "v0.2.2"
-git push origin v0.2.2
+git tag -a v0.2.3 -m "v0.2.3"
+git push origin v0.2.3
 ```
 
 The repository name is retained; the plugin ID and archive basename remain `codex-quota-reserve`, so the plugin keeps an independent runtime identity.

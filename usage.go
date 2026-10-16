@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
@@ -72,6 +73,7 @@ func HandleUsageFeedback(state *PluginState, record pluginapi.UsageRecord, now t
 			"auth_id": record.AuthID, "auth_index": record.AuthIndex, "status_code": record.Failure.StatusCode,
 		}, now)
 	}
+	resetHostCooldownAfterOverload(state, record, now)
 	if record.Provider == "codex" && !record.Failed {
 		// Real responses may carry an embedded quota snapshot (usage-record
 		// response headers on the WebSocket transport); observing it keeps the
@@ -113,6 +115,72 @@ func HandleUsageFeedback(state *PluginState, record pluginapi.UsageRecord, now t
 	}, now)
 }
 
+// resetHostCooldownAfterOverload repairs a host-side quota cooldown that was
+// caused by a transient model/provider overload. It deliberately requires a
+// known account without a confirmed quota exhaustion marker: a generic retry
+// signal must not erase real quota protection.
+func resetHostCooldownAfterOverload(state *PluginState, record pluginapi.UsageRecord, now time.Time) {
+	if state == nil || !isTransientOverloadFailure(record) {
+		return
+	}
+	authIndex, ok := resettableAuthIndex(state, record, now)
+	if !ok {
+		return
+	}
+	_, err := callHostCallback(pluginabi.MethodHostRoutingResetCooldown, pluginapi.HostRoutingResetCooldownRequest{
+		AuthIndex: authIndex,
+	})
+	if err != nil {
+		state.RecordLog("debug", "host.cooldown.reset_failed", "清除宿主过载冷却失败，保留插件侧短期冷却", map[string]any{
+			"auth_id": record.AuthID, "auth_index": authIndex, "error": err.Error(),
+		}, now)
+		return
+	}
+	state.RecordLog("info", "host.cooldown.reset", "已清除宿主因临时过载产生的账号冷却", map[string]any{
+		"auth_id": record.AuthID, "auth_index": authIndex, "status_code": record.Failure.StatusCode,
+	}, now)
+}
+
+func isTransientOverloadFailure(record pluginapi.UsageRecord) bool {
+	if record.Provider != "codex" || !record.Failed || strings.Contains(strings.ToLower(record.Failure.Body), "quota_reserve_unavailable") {
+		return false
+	}
+	if _, quotaFailure := DetectQuotaFailure(record, time.Time{}); quotaFailure {
+		return false
+	}
+	classification := classifyRetryStatus(record.Failure.StatusCode)
+	if record.Failure.StatusCode == 0 {
+		classification = classifyRetryFailure(record.Failure.Body)
+	}
+	// Model capacity and shared upstream overload can make CPA cool the selected
+	// auth even though the auth itself is healthy. Repair that host-side state,
+	// but leave real rate limits and quota exhaustion untouched.
+	return classification.Retryable &&
+		(classification.Kind == retryKindOverload || classification.Kind == retryKindCapacity)
+}
+
+func resettableAuthIndex(state *PluginState, record pluginapi.UsageRecord, now time.Time) (string, bool) {
+	for _, account := range state.Snapshot(now).Accounts {
+		if account.Provider != "codex" || account.TemporaryExhausted {
+			continue
+		}
+		if record.AuthID != "" && account.AuthID != record.AuthID {
+			continue
+		}
+		if record.AuthID == "" && record.AuthIndex != "" && account.AuthIndex != record.AuthIndex {
+			continue
+		}
+		if record.AuthIndex != "" && account.AuthIndex != "" && record.AuthIndex != account.AuthIndex {
+			continue
+		}
+		if account.AuthIndex == "" {
+			return "", false
+		}
+		return account.AuthIndex, true
+	}
+	return "", false
+}
+
 func isTransientUsageFailure(record pluginapi.UsageRecord) bool {
 	if record.Provider != "codex" || !record.Failed || strings.Contains(record.Failure.Body, "quota_reserve_unavailable") {
 		return false
@@ -124,7 +192,12 @@ func isTransientUsageFailure(record pluginapi.UsageRecord) bool {
 	if record.Failure.StatusCode == 0 {
 		classification = classifyRetryFailure(record.Failure.Body)
 	}
-	return classification.Retryable
+	// Overload and model-capacity failures are shared provider conditions. They
+	// should be retried within the current request, but must not turn one
+	// account into a repeatedly skipped account for later requests.
+	return classification.Retryable &&
+		classification.Kind != retryKindOverload &&
+		classification.Kind != retryKindCapacity
 }
 
 func shouldRecordCircuitSuccess(state *PluginState, record pluginapi.UsageRecord, now time.Time) (recordSuccess, temporaryActive bool) {
