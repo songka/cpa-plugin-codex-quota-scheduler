@@ -1,5 +1,5 @@
 PLUGIN_NAME ?= codex-quota-reserve
-VERSION ?= 0.2.3
+VERSION ?= 0.2.4
 BUILD_DIR ?= dist
 GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)

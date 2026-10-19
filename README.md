@@ -1,8 +1,12 @@
 # Codex Quota Reserve
 
-Independent CPA dynamic plugin `codex-quota-reserve`, targeting **CLIProxyAPI v8.0.27**, based on Jeffery's MIT Codex Quota Scheduler v0.3.2. Release version **0.2.3**, distributed from the existing public repository `songka/cpa-plugin-codex-quota-scheduler`.
+Independent CPA dynamic plugin `codex-quota-reserve`, targeting **CLIProxyAPI v8.0.27**, based on Jeffery's MIT Codex Quota Scheduler v0.3.2. Release version **0.2.4**, distributed from the existing public repository `songka/cpa-plugin-codex-quota-scheduler`.
 
 [中文安装与回滚手册](README.zh-CN.md) · [Upstream documentation](docs/upstream/README.md)
+
+## v0.2.4 Highlights
+
+- The retry-chain model catalog hides disabled, unavailable, and excluded models, including wildcard exclusions, while retaining a model when another account or provider still supports it.
 
 ## v0.2.3 Highlights
 
@@ -42,8 +46,8 @@ Go 1.26+, CGO, GCC and Make are required. Linux glibc is required; these shared 
 make test vet
 # Meaningful reserve concurrency checks:
 go test -race -run '^TestReserve' -count=1 ./...
-make package VERSION=0.2.3
-make checksums VERSION=0.2.3
+make package VERSION=0.2.4
+make checksums VERSION=0.2.4
 bash scripts/test-host-integration.sh
 ```
 
@@ -104,8 +108,8 @@ Set up GitHub Environment `release-approval` with required reviewers. Tags run f
 
 ```sh
 # Approval and passing host/platform tests are prerequisites.
-git tag -a v0.2.3 -m "v0.2.3"
-git push origin v0.2.3
+git tag -a v0.2.4 -m "v0.2.4"
+git push origin v0.2.4
 ```
 
 The repository name is retained; the plugin ID and archive basename remain `codex-quota-reserve`, so the plugin keeps an independent runtime identity.

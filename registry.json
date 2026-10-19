@@ -4,7 +4,7 @@
     {
       "id": "codex-quota-reserve",
       "name": "Codex Quota Reserve",
-      "description": "Codex OAuth quota reserve with optional CPA account disable/recovery, bounded automatic request budgets, quota history, in-plugin Webhook settings and scheduled usage reports. Shared model overload/capacity failures fail over without account cooldown; real 429 limits remain account-scoped. Requires CPA v8.0.27.",
+      "description": "Codex OAuth quota reserve with optional CPA account disable/recovery, bounded automatic request budgets, quota history, in-plugin Webhook settings and scheduled usage reports. Disabled and excluded models are hidden from the retry catalog while shared overload/capacity failures fail over without account cooldown; real 429 limits remain account-scoped. Requires CPA v8.0.27.",
       "author": "songka; based on Jeffery's Codex Quota Scheduler",
       "repository": "https://github.com/songka/cpa-plugin-codex-quota-scheduler",
       "homepage": "https://github.com/songka/cpa-plugin-codex-quota-scheduler",

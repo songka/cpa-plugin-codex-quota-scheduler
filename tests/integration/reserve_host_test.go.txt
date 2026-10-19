@@ -61,7 +61,7 @@ func TestReserveDynamicHostIntegration(t *testing.T) {
  host.ApplyConfig(context.Background(),&cfg)
  deadline:=time.Now().Add(15*time.Second)
  for len(host.RegisteredPlugins())!=1 && time.Now().Before(deadline) {time.Sleep(20*time.Millisecond)}
- if plugins:=host.RegisteredPlugins();len(plugins)!=1 || plugins[0].Metadata.Version!="0.2.3" {t.Fatalf("dynamic loading failed: %+v",plugins)}
+ if plugins:=host.RegisteredPlugins();len(plugins)!=1 || plugins[0].Metadata.Version!="0.2.4" {t.Fatalf("dynamic loading failed: %+v",plugins)}
  host.RegisterManagementRoutes(context.Background(),nil)
  call:=func(method,path string,body []byte) *httptest.ResponseRecorder {t.Helper();rr:=httptest.NewRecorder();req:=httptest.NewRequest(method,"http://host/v0/management/plugins/codex-quota-reserve"+path,bytes.NewReader(body));if !host.ServeManagementHTTP(rr,req) {t.Fatalf("management route absent %s",path)};return rr}
  call("POST","/refresh",nil)
