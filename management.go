@@ -1275,28 +1275,30 @@ func sanitizePublicStatusPayload(payload StatusPayload) StatusPayload {
 
 func buildCurrentStatusPayload(store *PluginState, now time.Time) StatusPayload {
 	snapshot := store.Snapshot(now)
+	refresherMu.Lock()
+	controller := globalRosterController
+	refresherMu.Unlock()
+	if controller != nil {
+		snapshot = filterSnapshotByRoster(snapshot, controller.Snapshot())
+	}
 	ordered := buildOrderedAccounts(syntheticStatusRequest(snapshot), snapshot, now, globalTrials)
 	return BuildStatusPayload(snapshot, ordered)
 }
 
 func buildCurrentStatusPayloadWithLifecycle(store *PluginState, now time.Time, lifecycle ManagementLifecycleSnapshot) StatusPayload {
 	snapshot := store.Snapshot(now)
-	active := make(map[string]struct{}, len(lifecycle.Roster.Instances))
-	for _, authID := range lifecycle.Roster.Instances {
-		if authID != "" {
-			active[authID] = struct{}{}
-		}
-	}
 	filtered := snapshot
-	filtered.Accounts = make([]AccountState, 0, len(active))
-	for _, account := range snapshot.Accounts {
-		if _, ok := active[account.AuthID]; !ok {
-			continue
+	var ordered []ScheduledAccount
+	if lifecycle.Roster.Confirmed {
+		filtered = filterSnapshotByRoster(snapshot, lifecycle.Roster)
+		for i := range filtered.Accounts {
+			filtered.Accounts[i].Priority = lifecycle.Roster.HighestPriority
 		}
-		account.Priority = lifecycle.Roster.HighestPriority
-		filtered.Accounts = append(filtered.Accounts, account)
+		ordered = buildOrderedAccounts(syntheticRosterStatusRequest(filtered, lifecycle.Roster), filtered, now, globalTrials)
+	} else {
+		// Cached accounts are not authoritative until CPA confirms its roster.
+		filtered.Accounts = nil
 	}
-	ordered := buildOrderedAccounts(syntheticRosterStatusRequest(filtered, lifecycle.Roster), filtered, now, globalTrials)
 	filtered = mergeManagedAccounts(filtered, lifecycle.ManagedLifecycle)
 	seen := map[string]bool{}
 	for i := range ordered {

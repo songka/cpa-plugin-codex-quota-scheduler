@@ -1,8 +1,14 @@
 # Codex Quota Reserve
 
-Independent CPA dynamic plugin `codex-quota-reserve`, targeting **CLIProxyAPI v8.0.27**, based on Jeffery's MIT Codex Quota Scheduler v0.3.2. Release version **0.2.4**, distributed from the existing public repository `songka/cpa-plugin-codex-quota-scheduler`.
+Independent CPA dynamic plugin `codex-quota-reserve`, targeting **CLIProxyAPI v8.0.27**, based on Jeffery's MIT Codex Quota Scheduler v0.3.2. Release version **0.2.5**, distributed from the existing public repository `songka/cpa-plugin-codex-quota-scheduler`.
 
 [中文安装与回滚手册](README.zh-CN.md) · [Upstream documentation](docs/upstream/README.md)
+
+## v0.2.5 Highlights
+
+- Per-account quota sections remain distinct; account notifications and scheduled reports are combined while they fit the provider payload limit, then paginated between complete account sections.
+- Stop notifications state why participation ended. Shared upstream overload is not mislabeled as an account fault, and short cooldown flicker is debounced for 30 seconds.
+- Accounts removed from CPA's authoritative active roster, including manually disabled accounts, are hidden from the plugin's current account view and notifications.
 
 ## v0.2.4 Highlights
 
@@ -46,8 +52,8 @@ Go 1.26+, CGO, GCC and Make are required. Linux glibc is required; these shared 
 make test vet
 # Meaningful reserve concurrency checks:
 go test -race -run '^TestReserve' -count=1 ./...
-make package VERSION=0.2.4
-make checksums VERSION=0.2.4
+make package VERSION=0.2.5
+make checksums VERSION=0.2.5
 bash scripts/test-host-integration.sh
 ```
 
@@ -108,8 +114,8 @@ Set up GitHub Environment `release-approval` with required reviewers. Tags run f
 
 ```sh
 # Approval and passing host/platform tests are prerequisites.
-git tag -a v0.2.4 -m "v0.2.4"
-git push origin v0.2.4
+git tag -a v0.2.5 -m "v0.2.5"
+git push origin v0.2.5
 ```
 
 The repository name is retained; the plugin ID and archive basename remain `codex-quota-reserve`, so the plugin keeps an independent runtime identity.

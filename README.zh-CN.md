@@ -1,8 +1,14 @@
 # Codex Quota Reserve 安装与回滚手册
 
-独立插件 ID：`codex-quota-reserve`。目标宿主：**CLIProxyAPI v8.0.27**。发行版本：**0.2.4**。发布仓库：`songka/cpa-plugin-codex-quota-scheduler`。
+独立插件 ID：`codex-quota-reserve`。目标宿主：**CLIProxyAPI v8.0.27**。发行版本：**0.2.5**。发布仓库：`songka/cpa-plugin-codex-quota-scheduler`。
 
 基于 Jeffery 的 MIT Codex Quota Scheduler v0.3.2 改造。[原版中文说明](docs/upstream/README.zh-CN.md)保留成熟功能的详细说明。
+
+## v0.2.5 主要更新
+
+- 状态变更与定时报告为每个账号显示独立额度区块；消息长度允许时合并到一条，超出平台限制才按完整账号分页。
+- 停止参与通知显示明确原因；模型共享过载不标记为账号故障，短时冷却抖动通过 30 秒去抖减少重复通知。
+- 已从 CPA 当前调度清单移除的手动停用账号不再显示在插件当前账号列表和通知中。
 
 ## v0.2.4 主要更新
 
@@ -35,7 +41,7 @@
 
 新增“达到预留线时在 CPA 中停用账号”开关，修复只标记保护但 CPA 仍显示启用的问题。默认不改变 CPA 停用状态，必须显式开启 `reserve_disable_accounts`；开启后记录停用所有权和凭据指纹，不接管人工停用账号，不自动启用轮换后的凭据。
 
-支持主动重置后的恢复：插件会按额度刷新间隔重新查询自己停用的账号，不需要等旧重置时间；点击刷新可提前检查。5h 和长期窗口均可用且高于保护线后自动启用，已停用账号仍保留在管理页面和通知报告中。
+支持主动重置后的恢复：插件会按额度刷新间隔重新查询自己停用的账号，不需要等旧重置时间；点击刷新可提前检查。5h 和长期窗口均可用且高于保护线后自动启用。由插件托管停用且仍在 CPA 当前调度清单中的账号继续显示；已从清单移除的手动停用账号隐藏。
 
 支持自动估算每请求消耗，配置上下限防止估计过大或过小；支持插件内配置 Webhook、定时使用报告和参与调度状态变更通知，消息展示额度、主动重置剩余次数和到期时间。
 
@@ -64,7 +70,7 @@ plugins:
       quota_refresh_interval: 5m
 ```
 
-使用现有公开仓库发布；商店安装需要 v0.2.4 Release 中存在对应架构 ZIP 和 `checksums.txt`。开发验收阶段也可将经过 SHA256 检查的对应架构 `.so` 放入挂载的插件目录。文件名必须为 `codex-quota-reserve.so`。插件库地址保持不变，版本由 GitHub 最新正式 Release 自动发现。CPA v8.0.27 缓存最新版本查询一小时，发布后仍显示旧版本时可等缓存过期，或备份后重启 CPA 再刷新插件库。
+使用现有公开仓库发布；商店安装需要 v0.2.5 Release 中存在对应架构 ZIP 和 `checksums.txt`。开发验收阶段也可将经过 SHA256 检查的对应架构 `.so` 放入挂载的插件目录。文件名必须为 `codex-quota-reserve.so`。插件库地址保持不变，版本由 GitHub 最新正式 Release 自动发现。CPA v8.0.27 缓存最新版本查询一小时，发布后仍显示旧版本时可等缓存过期，或备份后重启 CPA 再刷新插件库。
 
 ## 迁移与启用
 
@@ -108,16 +114,16 @@ plugins:
 ```sh
 make test vet
 go test -race -run '^TestReserve' -count=1 ./...
-make package VERSION=0.2.4
-make checksums VERSION=0.2.4
+make package VERSION=0.2.5
+make checksums VERSION=0.2.5
 bash scripts/test-host-integration.sh
 ```
 
 GitHub Actions 在 PR 时执行格式检查、回归、race 检查、真实宿主动态加载集成测试和双架构原生构建。配置带 required reviewers 的 `release-approval` GitHub Environment。测试完成并得到用户批准后才可以：
 
 ```sh
-git tag -a v0.2.4 -m "v0.2.4"
-git push origin v0.2.4
+git tag -a v0.2.5 -m "v0.2.5"
+git push origin v0.2.5
 ```
 
 仓库沿用现有名称；插件 ID、动态库和发行 ZIP 基名仍为 `codex-quota-reserve`，保持独立运行身份。参阅[验证记录和限制](docs/reserve-validation.md)。原 [MIT 许可证](LICENSE)和版权保留；正式再分发前需核对依赖许可证。

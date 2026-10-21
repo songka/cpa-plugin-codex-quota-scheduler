@@ -127,6 +127,27 @@ func TestNotificationMarkdownHandlesUnknownAndExpiredQuota(t *testing.T) {
 	}
 }
 
+func TestNotificationStopReasonIsRendered(t *testing.T) {
+	n := QuotaNotification{
+		Title: "账号停止参与调度",
+		Event: "scheduling_stopped",
+		At:    time.Date(2026, 10, 21, 0, 0, 0, 0, time.UTC),
+		Accounts: []NotificationAccount{{
+			AuthID:        "auth-1",
+			Participating: false,
+			Reason:        "upstream_cooldown",
+		}},
+	}
+	for name, body := range map[string]string{
+		"markdown": notificationMarkdown(n),
+		"html":     notificationHTML(n),
+	} {
+		if !strings.Contains(body, "停止原因") || !strings.Contains(body, "上游临时冷却") {
+			t.Errorf("%s notification omitted stop reason:\n%s", name, body)
+		}
+	}
+}
+
 func TestNotificationHTMLUsesEscapedQuotaCardLayout(t *testing.T) {
 	remaining := 53.0
 	text := notificationHTML(QuotaNotification{
@@ -381,6 +402,47 @@ func TestParticipationTrackerBatchesTransitionsAndRemoval(t *testing.T) {
 	}
 }
 
+func TestParticipationTrackerDebouncesTemporaryCooldownTransitions(t *testing.T) {
+	now := time.Date(2026, 10, 21, 0, 0, 0, 0, time.UTC)
+	s := StateSnapshot{
+		Config: DefaultConfig(), Now: now,
+		CPAAdmission: CPAAdmissionState{Observed: true, AuthIDs: map[string]struct{}{"auth-1": {}}},
+		Accounts:     []AccountState{{AuthID: "auth-1", Provider: "codex"}},
+	}
+	tracker := newParticipationTracker()
+	tracker.collect(s)
+
+	s.Now = now.Add(10 * time.Second)
+	s.Accounts[0].UpstreamCooldownUntil = s.Now.Add(time.Minute)
+	if got := tracker.collect(s); len(got) != 0 {
+		t.Fatalf("short temporary cooldown notified: %#v", got)
+	}
+	s.Now = now.Add(20 * time.Second)
+	s.Accounts[0].UpstreamCooldownUntil = time.Time{}
+	if got := tracker.collect(s); len(got) != 0 {
+		t.Fatalf("recovery inside debounce notified: %#v", got)
+	}
+
+	s.Now = now.Add(time.Minute)
+	s.Accounts[0].UpstreamCooldownUntil = s.Now.Add(time.Minute)
+	if got := tracker.collect(s); len(got) != 0 {
+		t.Fatalf("first sustained cooldown sample notified: %#v", got)
+	}
+	s.Now = now.Add(time.Minute + participationDebounceWindow)
+	s.Accounts[0].UpstreamCooldownUntil = s.Now.Add(time.Minute)
+	stopped := tracker.collect(s)
+	if len(stopped) != 1 || stopped[0].Event != "scheduling_stopped" ||
+		len(stopped[0].Accounts) != 1 || stopped[0].Accounts[0].Reason != "upstream_cooldown" {
+		t.Fatalf("sustained cooldown transition = %#v", stopped)
+	}
+	s.Now = now.Add(2 * time.Minute)
+	s.Accounts[0].UpstreamCooldownUntil = time.Time{}
+	recovered := tracker.collect(s)
+	if len(recovered) != 1 || recovered[0].Event != "scheduling_started" {
+		t.Fatalf("cooldown recovery = %#v", recovered)
+	}
+}
+
 func TestNotificationQueueRejectsHistoryEvents(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.NotificationsEnabled = true
@@ -422,6 +484,11 @@ func TestQuotaNotificationCombinesAccountsAndPaginatesByPayloadSize(t *testing.T
 			}
 			if kind == "generic" && len(pages) != 1 || kind != "generic" && len(pages) <= 1 {
 				t.Fatalf("page count = %d for %s", len(pages), kind)
+			}
+			for _, page := range pages {
+				if len(page.Accounts) == 0 {
+					t.Fatalf("empty account page for %s", kind)
+				}
 			}
 			var received [][]byte
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
