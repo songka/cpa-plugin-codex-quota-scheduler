@@ -318,7 +318,11 @@ func startReserveMonitor() {
 				snap := globalState.Snapshot(now)
 				refresherMu.Lock()
 				r := globalRefresher
+				controller := globalRosterController
 				refresherMu.Unlock()
+				if controller != nil {
+					snap = filterSnapshotByRoster(snap, controller.Snapshot())
+				}
 				if r != nil {
 					r = r.lifecycleRefresher()
 					if !now.Before(nextEnforce) {
@@ -327,7 +331,7 @@ func startReserveMonitor() {
 						}
 						nextEnforce = now.Add(5 * time.Second)
 					}
-					snap = snapshotWithManagedAccounts(globalState.Snapshot(now), r)
+					snap = snapshotWithManagedAccounts(snap, r)
 				}
 				events := globalState.history.collect(snap)
 				if snap.Config.ReserveEnabled && !now.Before(nextPoll) {
@@ -367,7 +371,7 @@ func startReserveMonitor() {
 					globalState.RecordLog("info", "reserve."+e["event"], "额度预留状态变化", map[string]any{"auth_id": e["auth_id"], "reason": e["reason"]}, now)
 				}
 				if report.due(snap.Config.TelemetryPolicy, now) {
-					notifications = append(notifications, notificationForEvent(snap, "usage_report", "", ""))
+					notifications = append(notifications, notificationsForAccounts(snap, "usage_report")...)
 				}
 				for _, n := range notifications {
 					globalState.queueQuotaNotification(n)

@@ -44,9 +44,10 @@ type QuotaNotification struct {
 var notificationZone = time.FixedZone("GMT+8", 8*60*60)
 
 const (
-	notificationProgressWidth = 10
-	notificationMaxResetRows  = 6
-	notificationPayloadLimit  = 4096
+	notificationProgressWidth   = 10
+	notificationMaxResetRows    = 6
+	notificationPayloadLimit    = 4096
+	participationDebounceWindow = 30 * time.Second
 )
 
 func validateNotificationEndpoint(endpoint string) error {
@@ -193,16 +194,37 @@ func (s *PluginState) runNotificationDelivery(ctx context.Context) {
 
 type participationTracker struct {
 	previous    map[string]NotificationAccount
+	pending     map[string]pendingParticipationChange
 	initialized bool
 }
 
+type pendingParticipationChange struct {
+	since time.Time
+}
+
 func newParticipationTracker() *participationTracker {
-	return &participationTracker{previous: map[string]NotificationAccount{}}
+	return &participationTracker{
+		previous: map[string]NotificationAccount{},
+		pending:  map[string]pendingParticipationChange{},
+	}
+}
+
+func temporaryParticipationReason(reason string) bool {
+	reason = strings.ToLower(strings.TrimSpace(reason))
+	switch reason {
+	case "upstream_cooldown", "upstream_429_cooldown", "temporary_exhausted":
+		return true
+	}
+	return strings.Contains(reason, "cooldown") || strings.Contains(reason, "temporary")
 }
 
 func (t *participationTracker) collect(s StateSnapshot) []QuotaNotification {
 	if !t.initialized && !s.CPAAdmission.Observed {
 		return nil
+	}
+	now := s.Now
+	if now.IsZero() {
+		now = time.Now()
 	}
 	next := map[string]NotificationAccount{}
 	changes := map[string][]NotificationAccount{}
@@ -211,14 +233,50 @@ func (t *participationTracker) collect(s StateSnapshot) []QuotaNotification {
 			continue
 		}
 		current := notificationAccount(a, s)
-		next[a.AuthID] = current
 		if !t.initialized {
+			next[a.AuthID] = current
 			continue
 		}
 		previous, known := t.previous[a.AuthID]
-		if (!known && !current.Participating) || (known && previous.Participating == current.Participating) {
+		if !known {
+			delete(t.pending, a.AuthID)
+			next[a.AuthID] = current
+			if !current.Participating {
+				continue
+			}
+			changes["scheduling_started"] = append(changes["scheduling_started"], current)
 			continue
 		}
+
+		if current.Participating {
+			// A recovery inside the debounce window cancels the pending
+			// temporary stop without publishing either side of the flicker.
+			delete(t.pending, a.AuthID)
+		}
+		if previous.Participating == current.Participating {
+			next[a.AuthID] = current
+			continue
+		}
+
+		if !current.Participating && temporaryParticipationReason(current.Reason) {
+			pending, ok := t.pending[a.AuthID]
+			if !ok {
+				t.pending[a.AuthID] = pendingParticipationChange{since: now}
+				next[a.AuthID] = previous
+				continue
+			}
+			if now.Before(pending.since.Add(participationDebounceWindow)) {
+				next[a.AuthID] = previous
+				continue
+			}
+			delete(t.pending, a.AuthID)
+			next[a.AuthID] = current
+			changes["scheduling_stopped"] = append(changes["scheduling_stopped"], current)
+			continue
+		}
+
+		delete(t.pending, a.AuthID)
+		next[a.AuthID] = current
 		event := "scheduling_stopped"
 		if current.Participating {
 			event = "scheduling_started"
@@ -226,7 +284,12 @@ func (t *participationTracker) collect(s StateSnapshot) []QuotaNotification {
 		changes[event] = append(changes[event], current)
 	}
 	for id, previous := range t.previous {
+		if _, hidden := s.HiddenAuthIDs[id]; hidden {
+			delete(t.pending, id)
+			continue
+		}
 		if _, exists := next[id]; !exists && previous.Participating {
+			delete(t.pending, id)
 			previous.Participating, previous.Reason = false, "account_removed"
 			changes["scheduling_stopped"] = append(changes["scheduling_stopped"], previous)
 		}
@@ -280,6 +343,25 @@ func snapshotWithManagedAccounts(s StateSnapshot, r *QuotaRefresher) StateSnapsh
 		return s
 	}
 	return mergeManagedAccounts(s, r.runtimeStore.managedLifecycleSnapshot())
+}
+
+func notificationsForAccounts(s StateSnapshot, event string) []QuotaNotification {
+	n := notificationForEvent(s, event, "", "")
+	n.Accounts = nil
+	for _, account := range s.Accounts {
+		if account.Provider != "codex" || account.AuthID == "" {
+			continue
+		}
+		n.Accounts = append(n.Accounts, notificationAccount(account, s))
+	}
+	sort.Slice(n.Accounts, func(i, j int) bool { return n.Accounts[i].AuthID < n.Accounts[j].AuthID })
+	if len(n.Accounts) == 1 {
+		n.Reason = n.Accounts[0].Reason
+	}
+	if len(n.Accounts) == 0 {
+		return nil
+	}
+	return []QuotaNotification{n}
 }
 
 func mergeManagedAccounts(s StateSnapshot, records map[string]ManagedDisableRecord) StateSnapshot {
@@ -474,6 +556,51 @@ func notificationAccountName(a NotificationAccount) string {
 	return a.AuthID
 }
 
+func notificationReasonLabel(reason string) string {
+	switch strings.TrimSpace(reason) {
+	case "":
+		return ""
+	case "managed_disabled":
+		return "插件托管停用"
+	case "scheduler_disabled":
+		return "插件调度功能已关闭"
+	case "roster_unconfirmed":
+		return "等待 CPA 调度清单确认"
+	case "outside_admission":
+		return "不在 CPA 当前调度清单"
+	case "upstream_cooldown":
+		return "上游临时冷却，模型暂时不可用"
+	case "upstream_429_cooldown":
+		return "上游返回 429，账号进入临时冷却"
+	case "upstream_quota_exhausted":
+		return "上游额度已耗尽"
+	case "temporary_exhausted":
+		return "临时额度耗尽，等待主动重置"
+	case "reserve_five_hour":
+		return "5 小时额度保护线"
+	case "reserve_long_window":
+		return "周/月额度保护线"
+	case "reserve_multi_window":
+		return "多个额度窗口同时触发保护"
+	case "reserve_concurrency":
+		return "在途请求达到并发限制"
+	case "reserve_budget":
+		return "预估消耗预算达到限制"
+	case "auth_failure":
+		return "认证异常，需要重新登录"
+	case "local_failure":
+		return "本地认证数据异常"
+	case "account_removed":
+		return "账号已从当前调度清单移除"
+	case "quota_or_account_unavailable":
+		return "额度或账号暂时不可用"
+	case "normal":
+		return ""
+	default:
+		return reason
+	}
+}
+
 func notificationResetRows(a NotificationAccount, at time.Time) []ResetCredit {
 	display := notificationResetCreditsForDisplay(a.ResetCredits, at)
 	if len(display) > notificationMaxResetRows {
@@ -490,7 +617,12 @@ func notificationMarkdown(n QuotaNotification) string {
 		if a.Participating {
 			state = "参与调度"
 		}
-		fmt.Fprintf(&b, "\n**%s** · %s\n\n", notificationLabel(notificationAccountName(a)), state)
+		fmt.Fprintf(&b, "\n---\n\n**%s** · %s\n\n", notificationLabel(notificationAccountName(a)), state)
+		if !a.Participating {
+			if reason := notificationReasonLabel(a.Reason); reason != "" {
+				fmt.Fprintf(&b, "停止原因：**%s**\n\n", notificationLabel(reason))
+			}
+		}
 		fmt.Fprintln(&b, "**主动重置过期时间（GMT+8）**")
 		availableResetCredits := notificationResetCreditsForDisplay(a.ResetCredits, n.At)
 		resetRows := notificationResetRows(a, n.At)
@@ -550,44 +682,49 @@ func notificationBody(kind, text string) any {
 }
 
 func notificationPages(p TelemetryPolicy, n QuotaNotification) ([]QuotaNotification, error) {
-	raw, err := json.Marshal(richNotificationBody(p, n))
-	if err != nil {
-		return nil, err
-	}
-	if p.NotificationKind == "generic" || len(raw) <= notificationPayloadLimit {
-		return []QuotaNotification{n}, nil
-	}
-	// Reserve the widest possible page suffix while packing complete accounts.
-	page := n
-	page.Title = fmt.Sprintf("%s (%d/%d)", n.Title, len(n.Accounts), len(n.Accounts))
-	var pages []QuotaNotification
-	start := 0
-	for end := 1; end <= len(n.Accounts); end++ {
-		page.Accounts = n.Accounts[start:end]
-		raw, err = json.Marshal(richNotificationBody(p, page))
+	if len(n.Accounts) == 0 {
+		raw, err := json.Marshal(richNotificationBody(p, n))
 		if err != nil {
 			return nil, err
 		}
-		if len(raw) <= notificationPayloadLimit {
+		if p.NotificationKind != "generic" && len(raw) > notificationPayloadLimit {
+			return nil, fmt.Errorf("notification exceeds message size limit")
+		}
+		return []QuotaNotification{n}, nil
+	}
+	if p.NotificationKind == "generic" {
+		return []QuotaNotification{n}, nil
+	}
+	pages := make([]QuotaNotification, 0, 1)
+	current := n
+	current.Accounts = nil
+	for _, account := range n.Accounts {
+		candidate := current
+		candidate.Accounts = append(append([]NotificationAccount(nil), current.Accounts...), account)
+		measure := candidate
+		measure.Title = fmt.Sprintf("%s (%d/%d)", n.Title, len(n.Accounts), len(n.Accounts))
+		raw, err := json.Marshal(richNotificationBody(p, measure))
+		if err != nil {
+			return nil, err
+		}
+		if p.NotificationKind != "generic" && len(raw) > notificationPayloadLimit {
+			if len(current.Accounts) == 0 {
+				return nil, fmt.Errorf("notification account exceeds message size limit")
+			}
+			pages = append(pages, current)
+			current = n
+			current.Accounts = []NotificationAccount{account}
 			continue
 		}
-		if end-start == 1 {
-			return nil, fmt.Errorf("notification account exceeds message size limit")
+		current = candidate
+	}
+	if len(current.Accounts) > 0 {
+		pages = append(pages, current)
+	}
+	if len(pages) > 1 {
+		for i := range pages {
+			pages[i].Title = fmt.Sprintf("%s (%d/%d)", n.Title, i+1, len(pages))
 		}
-		page.Accounts = n.Accounts[start : end-1]
-		pages = append(pages, page)
-		start = end - 1
-		end--
-	}
-	if start < len(n.Accounts) {
-		page.Accounts = n.Accounts[start:]
-		pages = append(pages, page)
-	}
-	if len(pages) == 0 {
-		return nil, fmt.Errorf("notification exceeds message size limit")
-	}
-	for i := range pages {
-		pages[i].Title = fmt.Sprintf("%s (%d/%d)", n.Title, i+1, len(pages))
 	}
 	return pages, nil
 }
@@ -677,7 +814,12 @@ func notificationHTML(n QuotaNotification) string {
 		if a.Participating {
 			state = "参与调度"
 		}
-		fmt.Fprintf(&b, "\n<b>%s</b> · %s\n", html.EscapeString(string(runes)), state)
+		fmt.Fprintf(&b, "\n<hr>\n<b>%s</b> · %s\n", html.EscapeString(string(runes)), state)
+		if !a.Participating {
+			if reason := notificationReasonLabel(a.Reason); reason != "" {
+				fmt.Fprintf(&b, "停止原因：<b>%s</b>\n", html.EscapeString(reason))
+			}
+		}
 		fmt.Fprintln(&b, "<b>主动重置过期时间（GMT+8）</b>")
 		availableResetCredits := notificationResetCreditsForDisplay(a.ResetCredits, n.At)
 		resetRows := notificationResetRows(a, n.At)

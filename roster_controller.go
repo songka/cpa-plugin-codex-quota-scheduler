@@ -324,6 +324,39 @@ func cloneActiveRoster(in ActiveRoster) ActiveRoster {
 	return in
 }
 
+// filterSnapshotByRoster projects cached quota state onto the last
+// authoritative CPA roster. A waiting or unconfirmed roster is intentionally
+// non-authoritative, so it must not hide cached accounts.
+func filterSnapshotByRoster(s StateSnapshot, roster ActiveRoster) StateSnapshot {
+	if !roster.Confirmed {
+		return s
+	}
+	active := make(map[string]struct{}, len(roster.Instances))
+	for _, authID := range roster.Instances {
+		if authID != "" {
+			active[authID] = struct{}{}
+		}
+	}
+	filtered := s
+	filtered.Accounts = make([]AccountState, 0, len(s.Accounts))
+	hidden := make(map[string]struct{})
+	for _, account := range s.Accounts {
+		if _, ok := active[account.AuthID]; ok {
+			filtered.Accounts = append(filtered.Accounts, account)
+			continue
+		}
+		if account.AuthID != "" {
+			hidden[account.AuthID] = struct{}{}
+		}
+	}
+	if len(hidden) == 0 {
+		filtered.HiddenAuthIDs = nil
+	} else {
+		filtered.HiddenAuthIDs = hidden
+	}
+	return filtered
+}
+
 func filterRosterEntries(entries []RosterEntry, ids []string) []RosterEntry {
 	set := make(map[string]struct{}, len(ids))
 	for _, id := range ids {

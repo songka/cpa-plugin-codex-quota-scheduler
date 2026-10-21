@@ -185,6 +185,10 @@ type TierAdmission struct {
 type StateSnapshot struct {
 	Config              Config
 	Accounts            []AccountState
+	// HiddenAuthIDs is a transient projection marker used when an
+	// authoritative CPA roster hides manually disabled accounts. Those
+	// accounts must be removed without generating a synthetic stop event.
+	HiddenAuthIDs       map[string]struct{}
 	CPAAdmission        CPAAdmissionState
 	CPAAdmissionVersion uint64
 	Annotations         AnnotationState
