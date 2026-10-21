@@ -51,9 +51,9 @@ func TestProbeOnProvisionalRosterIsExplicitRiskOption(t *testing.T) {
 	}
 }
 
-func TestPluginRegistrationUsesV024SourceVersion(t *testing.T) {
-	if got := PluginRegistration().Metadata.Version; got != "0.2.4" {
-		t.Fatalf("plugin registration version = %q, want 0.2.4", got)
+func TestPluginRegistrationUsesV025SourceVersion(t *testing.T) {
+	if got := PluginRegistration().Metadata.Version; got != "0.2.5" {
+		t.Fatalf("plugin registration version = %q, want 0.2.5", got)
 	}
 }
 
@@ -62,12 +62,12 @@ func TestReleaseVersionMetadataConsistent(t *testing.T) {
 		path string
 		want []string
 	}{
-		{"config.go", []string{`var pluginVersion = "0.2.4"`}},
-		{"Makefile", []string{"VERSION ?= 0.2.4"}},
-		{".github/workflows/build.yml", []string{"VERSION=0.2.4-dev"}},
-		{"README.md", []string{"## v0.2.4 Highlights", "make package VERSION=0.2.4", "make checksums VERSION=0.2.4", "git tag -a v0.2.4 -m \"v0.2.4\"", "git push origin v0.2.4"}},
-		{"README.zh-CN.md", []string{"## v0.2.4 主要更新", "make package VERSION=0.2.4", "make checksums VERSION=0.2.4", "git tag -a v0.2.4 -m \"v0.2.4\"", "git push origin v0.2.4"}},
-		{"tests/integration/reserve_host_test.go.txt", []string{`Metadata.Version!="0.2.4"`}},
+		{"config.go", []string{`var pluginVersion = "0.2.5"`}},
+		{"Makefile", []string{"VERSION ?= 0.2.5"}},
+		{".github/workflows/build.yml", []string{"VERSION=0.2.5-dev"}},
+		{"README.md", []string{"## v0.2.5 Highlights", "make package VERSION=0.2.5", "make checksums VERSION=0.2.5", "git tag -a v0.2.5 -m \"v0.2.5\"", "git push origin v0.2.5"}},
+		{"README.zh-CN.md", []string{"## v0.2.5 主要更新", "make package VERSION=0.2.5", "make checksums VERSION=0.2.5", "git tag -a v0.2.5 -m \"v0.2.5\"", "git push origin v0.2.5"}},
+		{"tests/integration/reserve_host_test.go.txt", []string{`Metadata.Version!="0.2.5"`}},
 	} {
 		contents, err := os.ReadFile(check.path)
 		if err != nil {

@@ -1296,9 +1296,8 @@ func buildCurrentStatusPayloadWithLifecycle(store *PluginState, now time.Time, l
 		}
 		ordered = buildOrderedAccounts(syntheticRosterStatusRequest(filtered, lifecycle.Roster), filtered, now, globalTrials)
 	} else {
-		// A waiting or provisional roster is not authoritative. Keep cached
-		// accounts visible until CPA confirms the active roster.
-		ordered = buildOrderedAccounts(syntheticStatusRequest(filtered), filtered, now, globalTrials)
+		// Cached accounts are not authoritative until CPA confirms its roster.
+		filtered.Accounts = nil
 	}
 	filtered = mergeManagedAccounts(filtered, lifecycle.ManagedLifecycle)
 	seen := map[string]bool{}

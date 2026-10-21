@@ -93,6 +93,9 @@ func accountParticipation(a AccountState, s StateSnapshot) (bool, string) {
 	if _, ok := s.CPAAdmission.AuthIDs[a.AuthID]; !ok {
 		return false, "outside_admission"
 	}
+	if a.UpstreamCooldownUntil.After(s.Now) {
+		return false, "upstream_cooldown"
+	}
 	v := accountViewFromState(a, s.Config, s.Now, nil)
 	if ClassifyAccount(v, s.Now) == Excluded {
 		if v.ReserveBlocked {
